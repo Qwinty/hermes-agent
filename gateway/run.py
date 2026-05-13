@@ -1797,6 +1797,21 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
 _AGENT_PENDING_SENTINEL = object()
 
 
+def _load_credential_pool_for_provider(provider: Optional[str]):
+    """Best-effort credential pool load for session-scoped runtime overrides."""
+    provider = (provider or "").strip().lower()
+    if not provider:
+        return None
+    try:
+        from agent.credential_pool import load_pool
+
+        pool = load_pool(provider)
+        return pool if pool and pool.has_credentials() else None
+    except Exception as exc:
+        logger.debug("Could not load credential pool for provider %s: %s", provider, exc)
+        return None
+
+
 def _resolve_runtime_agent_kwargs() -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances.
 
@@ -3724,8 +3739,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "api_key": override.get("api_key"),
                 "base_url": override.get("base_url"),
                 "api_mode": override.get("api_mode"),
-                "max_tokens": override.get("max_tokens"),
-                "credential_pool": override.get("credential_pool"),
+                "credential_pool": _load_credential_pool_for_provider(override.get("provider")),
             }
             if override_runtime.get("api_key"):
                 if override_runtime.get("credential_pool") is None:
