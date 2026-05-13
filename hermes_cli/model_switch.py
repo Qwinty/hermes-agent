@@ -1947,10 +1947,7 @@ def list_authenticated_providers(
             except Exception:
                 _cp_model_ids = curated.get(_cp.slug, [])
         else:
-            # Unified pathway — same as sections 1 and 2.
-            _cp_model_ids = cached_provider_model_ids(_cp.slug)
-            if not _cp_model_ids:
-                _cp_model_ids = curated.get(_cp.slug, [])
+            _cp_model_ids = provider_model_ids(_cp.slug) or curated.get(_cp.slug, [])
         _cp_total = len(_cp_model_ids)
         _cp_top = _cp_model_ids[:max_models] if max_models is not None else _cp_model_ids
 
