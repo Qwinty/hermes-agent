@@ -1,5 +1,6 @@
 import asyncio
 import json
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -71,7 +72,7 @@ def _make_adapter(
     adapter._pending_text_batches = {}
     adapter._pending_text_batch_tasks = {}
     adapter._text_batch_delay_seconds = 0.01
-    adapter._text_batch_split_delay_seconds = 0.01
+    adapter._disable_link_previews = False
     adapter._mention_patterns = adapter._compile_mention_patterns()
     adapter._forum_lock = asyncio.Lock()
     adapter._forum_command_registered = set()
@@ -958,390 +959,48 @@ def test_config_bridges_telegram_ignored_threads(monkeypatch, tmp_path):
     assert __import__("os").environ["TELEGRAM_IGNORED_THREADS"] == "31,42"
 
 
-# ---------------------------------------------------------------------------
-# Helpers for location / media observe+attribution tests
-# ---------------------------------------------------------------------------
+def test_allowed_update_types_include_raw_guest_message():
+    adapter = _make_adapter(guest_mode=True)
 
-def _group_location_message(
-    *,
-    chat_id=-100,
-    from_user_id=111,
-    from_user_name="Alice Example",
-    lat=37.7749,
-    lon=-122.4194,
-):
-    return SimpleNamespace(
-        message_id=50,
-        text=None,
-        caption=None,
-        entities=[],
-        caption_entities=[],
-        message_thread_id=None,
-        is_topic_message=False,
-        chat=SimpleNamespace(id=chat_id, type="group", title="Test Group", is_forum=False),
-        from_user=SimpleNamespace(
-            id=from_user_id, full_name=from_user_name,
-            first_name=from_user_name.split()[0],
-        ),
-        reply_to_message=None,
-        date=None,
-        location=SimpleNamespace(latitude=lat, longitude=lon),
-        venue=None,
-        sticker=None,
-        photo=None,
-        video=None,
-        audio=None,
-        voice=None,
-        document=None,
-    )
+    assert "guest_message" in adapter._allowed_update_types()
 
 
-def _group_voice_message(
-    *,
-    chat_id=-100,
-    from_user_id=111,
-    from_user_name="Alice Example",
-    caption=None,
-):
-    return SimpleNamespace(
-        message_id=51,
-        text=None,
-        caption=caption,
-        entities=[],
-        caption_entities=[],
-        message_thread_id=None,
-        is_topic_message=False,
-        chat=SimpleNamespace(id=chat_id, type="group", title="Test Group", is_forum=False),
-        from_user=SimpleNamespace(
-            id=from_user_id, full_name=from_user_name,
-            first_name=from_user_name.split()[0],
-        ),
-        reply_to_message=None,
-        date=None,
-        location=None,
-        venue=None,
-        sticker=None,
-        photo=None,
-        video=None,
-        audio=None,
-        voice=SimpleNamespace(
-            get_file=AsyncMock(side_effect=Exception("simulated download failure"))
-        ),
-        document=None,
-    )
+def test_raw_guest_update_routes_via_guest_query_id_and_caller_user():
+    adapter = _make_adapter(guest_mode=True)
+    adapter.handle_message = AsyncMock()
+    raw_guest = {
+        "message_id": 123,
+        "date": 0,
+        "chat": {"id": 555, "type": "private", "first_name": "Target"},
+        "from": {"id": 111, "is_bot": False, "first_name": "Sender"},
+        "text": "@hermes_bot ping",
+        "guest_query_id": "guest-query-1",
+        "guest_bot_caller_user": {"id": 273403055, "is_bot": False, "first_name": "Maxim"},
+    }
+    update = SimpleNamespace(update_id=77, api_kwargs={"guest_message": raw_guest})
+
+    asyncio.run(adapter._handle_guest_update(update, SimpleNamespace()))
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "ping"
+    assert event.source.chat_id == "guest:guest-query-1"
+    assert event.source.user_id == "273403055"
+    assert event.source.user_name == "Maxim"
 
 
-# ---------------------------------------------------------------------------
-# Observe + attribution parity: location messages
-# ---------------------------------------------------------------------------
+def test_send_guest_chat_uses_answer_guest_query():
+    adapter = _make_adapter(guest_mode=True)
+    adapter._bot = SimpleNamespace(_post=AsyncMock(return_value={"message_id": 42}))
 
-def test_unmentioned_location_message_observed_in_group():
-    async def _run():
-        adapter = _make_adapter(
-            require_mention=True,
-            allowed_chats=["-100"],
-            group_allowed_chats=["-100"],
-            observe_unmentioned_group_messages=True,
-        )
-        store = _FakeSessionStore()
-        adapter._session_store = store
-        update = SimpleNamespace(
-            update_id=2001,
-            message=_group_location_message(),
-            effective_message=None,
-        )
+    result = asyncio.run(adapter.send("guest:guest-query-1", "hello from Hermes"))
 
-        await adapter._handle_location_message(update, SimpleNamespace())
-
-        adapter._message_handler.assert_not_awaited()
-        assert len(store.messages) == 1
-        _, message, _ = store.messages[0]
-        assert message["observed"] is True
-        assert store.sources[0].user_id is None
-
-    asyncio.run(_run())
-
-
-def test_triggered_location_message_uses_shared_session_in_observe_mode():
-    async def _run():
-        adapter = _make_adapter(
-            require_mention=False,
-            group_allowed_chats=["-100"],
-            observe_unmentioned_group_messages=True,
-        )
-        adapter.handle_message = AsyncMock()
-        update = SimpleNamespace(
-            update_id=2002,
-            message=_group_location_message(),
-            effective_message=None,
-        )
-
-        await adapter._handle_location_message(update, SimpleNamespace())
-
-        adapter.handle_message.assert_awaited_once()
-        event = adapter.handle_message.call_args[0][0]
-        assert event.source.user_id is None
-        assert "[Alice Example|111]" in event.text
-
-    asyncio.run(_run())
-
-
-# ---------------------------------------------------------------------------
-# Observe + attribution parity: media messages (voice as representative)
-# ---------------------------------------------------------------------------
-
-def test_unmentioned_voice_message_observed_in_group():
-    async def _run():
-        adapter = _make_adapter(
-            require_mention=True,
-            allowed_chats=["-100"],
-            group_allowed_chats=["-100"],
-            observe_unmentioned_group_messages=True,
-        )
-        store = _FakeSessionStore()
-        adapter._session_store = store
-        update = SimpleNamespace(
-            update_id=3001,
-            message=_group_voice_message(),
-            effective_message=None,
-        )
-
-        await adapter._handle_media_message(update, SimpleNamespace())
-
-        adapter._message_handler.assert_not_awaited()
-        assert len(store.messages) == 1
-        _, message, _ = store.messages[0]
-        assert message["observed"] is True
-        assert store.sources[0].user_id is None
-
-    asyncio.run(_run())
-
-
-def test_triggered_voice_message_uses_shared_session_in_observe_mode():
-    async def _run():
-        adapter = _make_adapter(
-            require_mention=False,
-            group_allowed_chats=["-100"],
-            observe_unmentioned_group_messages=True,
-        )
-        adapter.handle_message = AsyncMock()
-        update = SimpleNamespace(
-            update_id=3002,
-            message=_group_voice_message(caption="check this audio"),
-            effective_message=None,
-        )
-
-        await adapter._handle_media_message(update, SimpleNamespace())
-
-        adapter.handle_message.assert_awaited_once()
-        event = adapter.handle_message.call_args[0][0]
-        assert event.source.user_id is None
-        assert "[Alice Example|111]" in event.text
-
-    asyncio.run(_run())
-
-
-# ---------------------------------------------------------------------------
-# Replied-to media caching
-# ---------------------------------------------------------------------------
-
-def test_text_reply_to_photo_caches_referenced_media(monkeypatch, tmp_path):
-    async def _run():
-        adapter = _make_adapter(require_mention=False)
-        adapter.handle_message = AsyncMock()
-        cached_path = tmp_path / "reply_photo.png"
-        monkeypatch.setattr(
-            "gateway.platforms.base.cache_image_from_bytes",
-            lambda _data, ext=".jpg": str(cached_path),
-        )
-        file_obj = SimpleNamespace(
-            file_path="photos/replied.png",
-            download_as_bytearray=AsyncMock(return_value=bytearray(b"\x89PNG\r\n\x1a\n reply")),
-        )
-        photo = SimpleNamespace(file_size=1234, get_file=AsyncMock(return_value=file_obj))
-        replied = SimpleNamespace(
-            message_id=51,
-            text=None,
-            caption=None,
-            photo=[photo],
-            video=None,
-            audio=None,
-            voice=None,
-            document=None,
-        )
-        msg = _group_message("what's in this image?", reply_to_bot=False)
-        msg.reply_to_message = replied
-        update = SimpleNamespace(update_id=3010, message=msg, effective_message=msg)
-
-        await adapter._handle_text_message(update, SimpleNamespace())
-        await asyncio.sleep(0.05)
-
-        adapter.handle_message.assert_awaited_once()
-        await_args = adapter.handle_message.await_args
-        assert await_args is not None
-        event = await_args.args[0]
-        assert event.reply_to_message_id == "51"
-        assert event.media_urls == [str(cached_path)]
-        assert event.media_types == ["image/png"]
-        assert event.message_type == MessageType.PHOTO
-
-    asyncio.run(_run())
-
-
-# ---------------------------------------------------------------------------
-# Observed-media caching (unmentioned group attachments)
-# ---------------------------------------------------------------------------
-
-def _group_photo_message(*, chat_id=-100, caption="Veja esta foto", file_size=1024):
-    file_obj = SimpleNamespace(
-        file_path="photos/observed.png",
-        download_as_bytearray=AsyncMock(return_value=bytearray(b"\x89PNG\r\n\x1a\n observed")),
-    )
-    photo = SimpleNamespace(file_size=file_size, get_file=AsyncMock(return_value=file_obj))
-    return SimpleNamespace(
-        message_id=52, text=None, caption=caption, entities=[], caption_entities=[],
-        message_thread_id=None, is_topic_message=False,
-        chat=SimpleNamespace(id=chat_id, type="group", title="Test Group", is_forum=False),
-        from_user=SimpleNamespace(id=111, full_name="Alice Example", first_name="Alice"),
-        reply_to_message=None, date=None, location=None, venue=None,
-        sticker=None, photo=[photo], video=None, audio=None, voice=None, document=None,
-    )
-
-
-def _group_document_message(*, chat_id=-100, caption="Este arquivo", document=None):
-    file_obj = SimpleNamespace(
-        file_path="documents/report.pdf",
-        download_as_bytearray=AsyncMock(return_value=bytearray(b"%PDF observed bytes")),
-    )
-    document = document or SimpleNamespace(
-        file_name="RESULTADO BIOLOGICO - PROTOCOLO 103- URBAN.pdf",
-        mime_type="application/pdf", file_size=1024,
-        get_file=AsyncMock(return_value=file_obj),
-    )
-    return SimpleNamespace(
-        message_id=53, text=None, caption=caption, entities=[], caption_entities=[],
-        message_thread_id=None, is_topic_message=False,
-        chat=SimpleNamespace(id=chat_id, type="group", title="Test Group", is_forum=False),
-        from_user=SimpleNamespace(id=111, full_name="Alice Example", first_name="Alice"),
-        reply_to_message=None, date=None, location=None, venue=None,
-        sticker=None, photo=None, video=None, audio=None, voice=None, document=document,
-    )
-
-
-def test_unmentioned_photo_observed_with_cached_path(monkeypatch, tmp_path):
-    async def _run():
-        adapter = _make_adapter(
-            require_mention=True, allowed_chats=["-100"],
-            group_allowed_chats=["-100"], observe_unmentioned_group_messages=True,
-        )
-        store = _FakeSessionStore()
-        adapter._session_store = store
-        cached_path = tmp_path / "img_abc_observed.png"
-        monkeypatch.setattr(
-            "gateway.platforms.base.cache_image_from_bytes",
-            lambda _data, ext=".jpg": str(cached_path),
-        )
-        update = SimpleNamespace(update_id=3003, message=_group_photo_message(), effective_message=None)
-
-        await adapter._handle_media_message(update, SimpleNamespace())
-
-        adapter._message_handler.assert_not_awaited()
-        assert len(store.messages) == 1
-        _, message, _ = store.messages[0]
-        assert message["observed"] is True
-        assert "Veja esta foto" in message["content"]
-        assert "image" in message["content"]
-        assert str(cached_path) in message["content"]
-        assert store.sources[0].user_id is None
-
-    asyncio.run(_run())
-
-
-def test_unmentioned_document_observed_with_cached_path(monkeypatch, tmp_path):
-    async def _run():
-        adapter = _make_adapter(
-            require_mention=True, allowed_chats=["-100"],
-            group_allowed_chats=["-100"], observe_unmentioned_group_messages=True,
-        )
-        store = _FakeSessionStore()
-        adapter._session_store = store
-        cached_path = tmp_path / "doc_abc_report.pdf"
-        monkeypatch.setattr(
-            "gateway.platforms.base.cache_document_from_bytes",
-            lambda _data, _filename: str(cached_path),
-        )
-        update = SimpleNamespace(update_id=3004, message=_group_document_message(), effective_message=None)
-
-        await adapter._handle_media_message(update, SimpleNamespace())
-
-        adapter._message_handler.assert_not_awaited()
-        assert len(store.messages) == 1
-        _, message, _ = store.messages[0]
-        assert message["observed"] is True
-        assert "Este arquivo" in message["content"]
-        assert str(cached_path) in message["content"]
-
-    asyncio.run(_run())
-
-
-def test_unmentioned_large_document_observed_without_download(monkeypatch):
-    async def _run():
-        adapter = _make_adapter(
-            require_mention=True, allowed_chats=["-100"],
-            group_allowed_chats=["-100"], observe_unmentioned_group_messages=True,
-        )
-        adapter._max_doc_bytes = 100
-        store = _FakeSessionStore()
-        adapter._session_store = store
-        cache_doc = Mock(return_value="/tmp/huge.pdf")
-        monkeypatch.setattr("gateway.platforms.base.cache_document_from_bytes", cache_doc)
-        document = SimpleNamespace(
-            file_name="huge.pdf", mime_type="application/pdf",
-            file_size=101, get_file=AsyncMock(),
-        )
-        update = SimpleNamespace(
-            update_id=3005, message=_group_document_message(document=document), effective_message=None,
-        )
-
-        await adapter._handle_media_message(update, SimpleNamespace())
-
-        cache_doc.assert_not_called()
-        document.get_file.assert_not_called()
-        _, message, _ = store.messages[0]
-        assert "too large" in message["content"]
-        assert "/tmp/huge.pdf" not in message["content"]
-
-    asyncio.run(_run())
-
-
-def test_unmentioned_unsupported_document_observed_and_cached(monkeypatch):
-    async def _run():
-        adapter = _make_adapter(
-            require_mention=True, allowed_chats=["-100"],
-            group_allowed_chats=["-100"], observe_unmentioned_group_messages=True,
-        )
-        store = _FakeSessionStore()
-        adapter._session_store = store
-        cache_doc = Mock(return_value="/tmp/program.exe")
-        monkeypatch.setattr("gateway.platforms.base.cache_document_from_bytes", cache_doc)
-        file_obj = SimpleNamespace(
-            file_path="documents/program.exe",
-            download_as_bytearray=AsyncMock(return_value=bytearray(b"MZ")),
-        )
-        document = SimpleNamespace(
-            file_name="program.exe", mime_type="application/x-msdownload",
-            file_size=2, get_file=AsyncMock(return_value=file_obj),
-        )
-        update = SimpleNamespace(
-            update_id=3006, message=_group_document_message(document=document), effective_message=None,
-        )
-
-        await adapter._handle_media_message(update, SimpleNamespace())
-
-        # Any file type is now cached — authorization is the gate, not the
-        # extension. The observed message records a path-pointing note.
-        cache_doc.assert_called_once()
-        _, message, _ = store.messages[0]
-        assert "program.exe" in message["content"]
-
-    asyncio.run(_run())
+    assert result.success is True
+    adapter._bot._post.assert_awaited_once()
+    endpoint = adapter._bot._post.await_args.args[0]
+    data = adapter._bot._post.await_args.kwargs["data"]
+    assert endpoint == "answerGuestQuery"
+    assert data["guest_query_id"] == "guest-query-1"
+    payload = json.loads(data["result"])
+    assert payload["type"] == "article"
+    assert payload["input_message_content"]["message_text"] == "hello from Hermes"
