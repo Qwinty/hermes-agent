@@ -1291,11 +1291,12 @@ def test_raw_guest_update_routes_via_guest_query_id_and_caller_user():
 
 def test_send_guest_chat_uses_answer_guest_query():
     adapter = _make_adapter(guest_mode=True)
-    adapter._bot = SimpleNamespace(_post=AsyncMock(return_value={"message_id": 42}))
+    adapter._bot = SimpleNamespace(_post=AsyncMock(return_value={"inline_message_id": "inline-42"}))
 
     result = asyncio.run(adapter.send("guest:guest-query-1", "hello from Hermes"))
 
     assert result.success is True
+    assert result.message_id == "inline-42"
     adapter._bot._post.assert_awaited_once()
     endpoint = adapter._bot._post.await_args.args[0]
     data = adapter._bot._post.await_args.kwargs["data"]
@@ -1304,4 +1305,5 @@ def test_send_guest_chat_uses_answer_guest_query():
     payload = json.loads(data["result"])
     assert payload["type"] == "article"
     assert payload["input_message_content"]["message_text"] == "hello from Hermes"
+
 
