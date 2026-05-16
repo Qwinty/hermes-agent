@@ -72,6 +72,7 @@ def _make_adapter(
     adapter._pending_text_batch_tasks = {}
     adapter._text_batch_delay_seconds = 0.01
     adapter._text_batch_split_delay_seconds = 0.01
+    adapter._disable_link_previews = False
     adapter._mention_patterns = adapter._compile_mention_patterns()
     adapter._forum_lock = asyncio.Lock()
     adapter._forum_command_registered = set()
@@ -1345,3 +1346,50 @@ def test_unmentioned_unsupported_document_observed_and_cached(monkeypatch):
         assert "program.exe" in message["content"]
 
     asyncio.run(_run())
+
+
+def test_allowed_update_types_include_raw_guest_message():
+    adapter = _make_adapter(guest_mode=True)
+
+    assert "guest_message" in adapter._allowed_update_types()
+
+
+def test_raw_guest_update_routes_via_guest_query_id_and_caller_user():
+    adapter = _make_adapter(guest_mode=True)
+    adapter.handle_message = AsyncMock()
+    raw_guest = {
+        "message_id": 123,
+        "date": 0,
+        "chat": {"id": 555, "type": "private", "first_name": "Target"},
+        "from": {"id": 111, "is_bot": False, "first_name": "Sender"},
+        "text": "@hermes_bot ping",
+        "guest_query_id": "guest-query-1",
+        "guest_bot_caller_user": {"id": 273403055, "is_bot": False, "first_name": "Maxim"},
+    }
+    update = SimpleNamespace(update_id=77, api_kwargs={"guest_message": raw_guest})
+
+    asyncio.run(adapter._handle_guest_update(update, SimpleNamespace()))
+
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "ping"
+    assert event.source.chat_id == "guest:guest-query-1"
+    assert event.source.user_id == "273403055"
+    assert event.source.user_name == "Maxim"
+
+
+def test_send_guest_chat_uses_answer_guest_query():
+    adapter = _make_adapter(guest_mode=True)
+    adapter._bot = SimpleNamespace(_post=AsyncMock(return_value={"message_id": 42}))
+
+    result = asyncio.run(adapter.send("guest:guest-query-1", "hello from Hermes"))
+
+    assert result.success is True
+    adapter._bot._post.assert_awaited_once()
+    endpoint = adapter._bot._post.await_args.args[0]
+    data = adapter._bot._post.await_args.kwargs["data"]
+    assert endpoint == "answerGuestQuery"
+    assert data["guest_query_id"] == "guest-query-1"
+    payload = json.loads(data["result"])
+    assert payload["type"] == "article"
+    assert payload["input_message_content"]["message_text"] == "hello from Hermes"
