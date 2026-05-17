@@ -1085,6 +1085,18 @@ def run_conversation(
         max_retries = agent._api_max_retries
         _retry = TurnRetryState()
         max_compression_attempts = 3
+        codex_auth_retry_attempted=False
+        anthropic_auth_retry_attempted=False
+        nous_auth_retry_attempted=False
+        copilot_auth_retry_attempted=False
+        thinking_sig_retry_attempted = False
+        xai_encrypted_retry_attempted = False
+        image_shrink_retry_attempted = False
+        oauth_1m_beta_retry_attempted = False
+        llama_cpp_grammar_retry_attempted = False
+        has_retried_429 = False
+        restart_with_compressed_messages = False
+        restart_with_length_continuation = False
 
         finish_reason = "stop"
         response = None  # Guard against UnboundLocalError if all retries fail
@@ -2801,8 +2813,40 @@ def run_conversation(
                     print(f"{agent.log_prefix}     • Legacy cleanup: hermes config set ANTHROPIC_TOKEN \"\"")
                     print(f"{agent.log_prefix}     • Clear stale keys: hermes config set ANTHROPIC_API_KEY \"\"")
 
-                # Thinking block signature recovery.
-                #
+                # ── xAI encrypted-content recovery ──────────────────────
+                # Grok Responses requires encrypted reasoning blobs to come
+                # back to the same provider that issued them. Mid-session
+                # provider switches can leave stale Responses history from a
+                # different backend in memory; replaying that into xAI yields
+                # HTTP 400 "Could not decrypt the provided encrypted_content".
+                if (
+                    agent.api_mode == "codex_responses"
+                    and (agent.provider == "xai" or getattr(agent, "_base_url_hostname", "") == "api.x.ai")
+                    and status_code == 400
+                    and not xai_encrypted_retry_attempted
+                ):
+                    _err_text_lower = str(api_error).lower()
+                    _xai_encrypted_error = (
+                        "could not decrypt the provided encrypted_content" in _err_text_lower
+                        or "invalid_encrypted_content" in _err_text_lower
+                    )
+                    if _xai_encrypted_error:
+                        xai_encrypted_retry_attempted = True
+                        stripped_history = agent._strip_provider_reasoning_state(messages)
+                        stripped_api = agent._strip_provider_reasoning_state(api_messages)
+                        agent._vprint(
+                            f"{agent.log_prefix}⚠️  xAI rejected encrypted reasoning from earlier provider history — stripped provider-specific reasoning state and retrying...",
+                            force=True,
+                        )
+                        logging.warning(
+                            "%sxAI encrypted_content recovery: stripped %d fields from history and %d fields from api_messages",
+                            agent.log_prefix,
+                            stripped_history,
+                            stripped_api,
+                        )
+                        continue
+
+                # ── Thinking block signature recovery ─────────────────
                 # Anthropic signs thinking blocks against the full turn
                 # content. Any upstream mutation (context compression,
                 # session truncation, message merging) invalidates the

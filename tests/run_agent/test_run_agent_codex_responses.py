@@ -2629,105 +2629,82 @@ def test_preflight_codex_input_deduplicates_reasoning_ids(monkeypatch):
         assert "id" not in it
 
 
-def test_run_conversation_codex_disables_reasoning_replay_after_invalid_encrypted_content(monkeypatch):
+def test_switch_model_scrubs_provider_reasoning_state_on_provider_change(monkeypatch):
     agent = _build_agent(monkeypatch)
-    agent.provider = "custom"
-    agent.base_url = "https://api.example.com/v1"
+    agent.context_compressor = None
+    agent.messages = [
+        {
+            "role": "assistant",
+            "content": "Old provider turn",
+            "reasoning_details": [{"type": "reasoning.encrypted_content", "encrypted_content": "opaque"}],
+            "codex_reasoning_items": [{"type": "reasoning", "encrypted_content": "enc_a"}],
+            "codex_message_items": [{"type": "message", "content": [{"type": "output_text", "text": "hi"}]}],
+        },
+        {"role": "user", "content": "keep context"},
+    ]
+    agent._fallback_chain = [
+        {"provider": "openai-codex", "model": "gpt-5-codex"},
+        {"provider": "xai", "model": "grok-4.3"},
+        {"provider": "copilot", "model": "gpt-5.4"},
+    ]
+    monkeypatch.setattr(agent, "_create_openai_client", lambda kwargs, reason, shared: object())
+    monkeypatch.setattr(agent, "_anthropic_prompt_cache_policy", lambda **kwargs: (False, False))
+    monkeypatch.setattr(agent, "_ensure_lmstudio_runtime_loaded", lambda: None)
 
-    request_payloads = []
+    agent.switch_model(
+        "grok-4.3",
+        "xai",
+        api_key="xai-token",
+        base_url="https://api.x.ai/v1",
+        api_mode="codex_responses",
+    )
 
-    class _InvalidEncryptedContentError(Exception):
-        def __init__(self):
-            super().__init__(
-                "Error code: 400 - The encrypted content for item rs_001 could not be verified. "
-                "Reason: Encrypted content could not be decrypted or parsed."
-            )
-            self.status_code = 400
-            self.body = {
-                "error": {
-                    "message": (
-                        '{"error":{"message":"The encrypted content for item rs_001 could not be verified. '
-                        'Reason: Encrypted content could not be decrypted or parsed.",'
-                        '"type":"invalid_request_error","param":"","code":"invalid_encrypted_content"}}'
-                    ),
-                    "type": "400",
-                }
-            }
+    assistant_msg = agent.messages[0]
+    assert agent.provider == "xai"
+    assert "reasoning_details" not in assistant_msg
+    assert "codex_reasoning_items" not in assistant_msg
+    assert "codex_message_items" not in assistant_msg
+    assert agent._fallback_chain == [{"provider": "copilot", "model": "gpt-5.4"}]
 
-    responses = [_InvalidEncryptedContentError(), _codex_message_response("Recovered without replay.")]
 
-    def _fake_api_call(api_kwargs):
-        request_payloads.append(api_kwargs)
-        current = responses.pop(0)
-        if isinstance(current, Exception):
-            raise current
-        return current
-
-    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
-
+def test_run_conversation_xai_encrypted_content_error_retries_after_scrub(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    agent.provider = "xai"
+    agent.api_mode = "codex_responses"
+    agent.base_url = "https://api.x.ai/v1"
+    agent._base_url_hostname = "api.x.ai"
+    calls = {"api": 0}
     history = [
         {
             "role": "assistant",
-            "content": "",
-            "finish_reason": "incomplete",
-            "codex_reasoning_items": [
-                {"type": "reasoning", "id": "rs_001", "encrypted_content": "enc_bad", "summary": []},
-            ],
+            "content": "Old provider turn",
+            "reasoning_details": [{"type": "reasoning.encrypted_content", "encrypted_content": "opaque"}],
+            "codex_reasoning_items": [{"type": "reasoning", "encrypted_content": "enc_a"}],
+            "codex_message_items": [{"type": "message", "content": [{"type": "output_text", "text": "hi"}]}],
         }
     ]
 
-    result = agent.run_conversation("continue", conversation_history=history)
-
-    assert result["completed"] is True
-    assert result["final_response"] == "Recovered without replay."
-    assert len(request_payloads) == 2
-    assert any(item.get("type") == "reasoning" for item in request_payloads[0]["input"])
-    assert not any(item.get("type") == "reasoning" for item in request_payloads[1]["input"])
-    assert request_payloads[0].get("include") == ["reasoning.encrypted_content"]
-    assert request_payloads[1].get("include") == []
-    assert result["messages"][0].get("codex_reasoning_items") is None
-    assert agent._codex_reasoning_replay_enabled is False
-
-
-def test_run_conversation_codex_invalid_encrypted_content_without_replay_state_does_not_disable_replay(monkeypatch):
-    agent = _build_agent(monkeypatch)
-    agent.provider = "custom"
-    agent.base_url = "https://api.example.com/v1"
-    monkeypatch.setattr(run_agent, "jittered_backoff", lambda *args, **kwargs: 0)
-
-    request_payloads = []
-
-    class _InvalidEncryptedContentError(Exception):
+    class _BadRequestError(RuntimeError):
         def __init__(self):
-            super().__init__("Error code: 400 - bad request")
+            super().__init__(
+                "Error code: 400 - Could not decrypt the provided encrypted_content. "
+                "Ensure the value is the unmodified encrypted_content from a previous response."
+            )
             self.status_code = 400
-            self.body = {
-                "error": {
-                    "code": "INVALID_ENCRYPTED_CONTENT",
-                    "message": "Bad request",
-                }
-            }
-
-    responses = [_InvalidEncryptedContentError(), _codex_message_response("Recovered after generic retry.")]
 
     def _fake_api_call(api_kwargs):
-        request_payloads.append(api_kwargs)
-        current = responses.pop(0)
-        if isinstance(current, Exception):
-            raise current
-        return current
+        calls["api"] += 1
+        if calls["api"] == 1:
+            raise _BadRequestError()
+        return _codex_message_response("Recovered after xAI scrub")
 
     monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
 
-    result = agent.run_conversation(
-        "continue",
-        conversation_history=[{"role": "assistant", "content": "No replay state here."}],
-    )
+    result = agent.run_conversation("Say OK", conversation_history=history)
 
+    assert calls["api"] == 2
     assert result["completed"] is True
-    assert result["final_response"] == "Recovered after generic retry."
-    assert len(request_payloads) == 2
-    assert all(payload.get("include") == ["reasoning.encrypted_content"] for payload in request_payloads)
-    assert all(not any(item.get("type") == "reasoning" for item in payload["input"]) for payload in request_payloads)
-    assert agent._codex_reasoning_replay_enabled is True
-    assert result["messages"][0].get("codex_reasoning_items") is None
+    assert result["final_response"] == "Recovered after xAI scrub"
+    assert "reasoning_details" not in result["messages"][0]
+    assert "codex_reasoning_items" not in result["messages"][0]
+    assert "codex_message_items" not in result["messages"][0]

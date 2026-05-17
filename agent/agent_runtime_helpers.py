@@ -2026,6 +2026,12 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     new_norm = (new_provider or "").strip().lower()
     fallback_chain = list(getattr(agent, "_fallback_chain", []) or [])
     if old_norm and new_norm and old_norm != new_norm:
+        stripped = agent._strip_provider_reasoning_state(getattr(agent, "messages", None))
+        if stripped:
+            logging.info(
+                "Provider switch scrubbed %d provider-specific reasoning fields from in-memory history",
+                stripped,
+            )
         fallback_chain = [
             entry for entry in fallback_chain
             if (entry.get("provider") or "").strip().lower() not in {old_norm, new_norm}

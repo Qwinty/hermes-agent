@@ -2041,11 +2041,7 @@ DEFAULT_CONFIG = {
     
     "stt": {
         "enabled": True,
-        # When true, gateway voice messages are transcribed for the agent and
-        # the raw transcript is also echoed back to the user as a 🎙️ message.
-        # Set false to keep STT for the agent while suppressing that user-facing echo.
-        "echo_transcripts": True,
-        "provider": "local",  # "local" (free, faster-whisper) | "groq" | "openai" (Whisper API) | "mistral" (Voxtral Transcribe) | "elevenlabs" (Scribe)
+        "provider": "local",  # "local" (free, faster-whisper) | "groq" | "openai" (Whisper API) | "mistral" (Voxtral Transcribe) | "deepgram" | "xai"
         "local": {
             "model": "base",  # tiny, base, small, medium, large-v3
             "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
@@ -2056,11 +2052,13 @@ DEFAULT_CONFIG = {
         "mistral": {
             "model": "voxtral-mini-latest",  # voxtral-mini-latest, voxtral-mini-2602
         },
-        "elevenlabs": {
-            "model_id": "scribe_v2",  # scribe_v2, scribe_v1
-            "language_code": "",  # auto-detect by default; set to "eng", "spa", "fra", etc. to force
-            "tag_audio_events": False,
-            "diarize": False,
+        "deepgram": {
+            "model": "nova-3",      # Best general-purpose/WER choice for Russian per Deepgram docs
+            "language": "ru",       # Force Russian instead of default English
+            "smart_format": True,    # Enables punctuation + best-available formatting
+            "paragraphs": True,      # Improves readability for longer voice notes
+            "utterances": True,      # Better semantic segmentation in the API response
+            "numerals": True,        # Convert spoken numbers into numeric form when supported
         },
     },
 
@@ -3808,6 +3806,13 @@ OPTIONAL_ENV_VARS = {
         "description": "Mistral API key for Voxtral TTS and transcription (STT)",
         "prompt": "Mistral API key",
         "url": "https://console.mistral.ai/",
+        "password": True,
+        "category": "tool",
+    },
+    "DEEPGRAM_API_KEY": {
+        "description": "Deepgram API key for speech-to-text transcription (STT)",
+        "prompt": "Deepgram API key",
+        "url": "https://console.deepgram.com/",
         "password": True,
         "category": "tool",
     },
@@ -7979,7 +7984,7 @@ def set_config_value(key: str, value: str):
     # Check if it's an API key (goes to .env)
     api_keys = [
         'OPENROUTER_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'VOICE_TOOLS_OPENAI_KEY',
-        'EXA_API_KEY', 'PARALLEL_API_KEY', 'FIRECRAWL_API_KEY', 'FIRECRAWL_API_URL',
+        'DEEPGRAM_API_KEY', 'EXA_API_KEY', 'PARALLEL_API_KEY', 'FIRECRAWL_API_KEY', 'FIRECRAWL_API_URL',
         'FIRECRAWL_GATEWAY_URL', 'TOOL_GATEWAY_DOMAIN', 'TOOL_GATEWAY_SCHEME',
         'TOOL_GATEWAY_USER_TOKEN', 'TAVILY_API_KEY',
         'BROWSERBASE_API_KEY', 'BROWSERBASE_PROJECT_ID', 'BROWSER_USE_API_KEY',
