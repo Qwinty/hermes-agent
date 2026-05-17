@@ -772,19 +772,16 @@ CREATE TABLE IF NOT EXISTS state_meta (
     value TEXT
 );
 
-CREATE TABLE IF NOT EXISTS gateway_routing (
-    scope TEXT NOT NULL DEFAULT '',
-    session_key TEXT NOT NULL,
-    entry_json TEXT NOT NULL,
-    updated_at REAL NOT NULL,
-    PRIMARY KEY (scope, session_key)
+CREATE TABLE IF NOT EXISTS gateway_session_model_overrides (
+    session_key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at REAL NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS compression_locks (
-    session_id TEXT PRIMARY KEY,
-    holder TEXT NOT NULL,
-    acquired_at REAL NOT NULL,
-    expires_at REAL NOT NULL
+CREATE TABLE IF NOT EXISTS gateway_session_reasoning_overrides (
+    session_key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at REAL NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
@@ -1224,21 +1221,113 @@ class SessionDB:
         except Exception:
             pass  # Best effort — never fatal.
 
-    def _try_optimize_fts(self) -> None:
-        """Best-effort FTS5 segment merge. Never raises.
+    # ── Gateway runtime overrides ──────────────────────────────────────────
 
-        Runs on the ``_OPTIMIZE_EVERY_N_WRITES`` cadence from the write hot
-        path (off the lock — ``optimize_fts`` re-acquires ``self._lock``
-        itself, mirroring ``_try_wal_checkpoint``). ``read_only`` connections
-        never reach the write path, so this is implicitly skipped for them.
-        Once the index is merged the 'optimize' command is close to free, so
-        the steady-state cost is negligible; the expensive case is only the
-        first merge of a long-neglected index.
-        """
-        try:
-            self.optimize_fts()
-        except Exception:
-            pass  # Best effort — never fatal.
+    def get_gateway_session_model_overrides(self) -> Dict[str, Dict[str, Any]]:
+        """Return all persisted gateway session-scoped model overrides."""
+        with self._lock:
+            conn = self._conn
+            if conn is None:
+                return {}
+            rows = conn.execute(
+                "SELECT session_key, value FROM gateway_session_model_overrides"
+            ).fetchall()
+        overrides: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            session_key = row["session_key"] if isinstance(row, sqlite3.Row) else row[0]
+            raw = row["value"] if isinstance(row, sqlite3.Row) else row[1]
+            try:
+                value = json.loads(raw)
+            except Exception:
+                continue
+            if isinstance(value, dict):
+                overrides[str(session_key)] = value
+        return overrides
+
+    def set_gateway_session_model_override(
+        self,
+        session_key: str,
+        override: Dict[str, Any],
+    ) -> None:
+        """Persist a gateway session-scoped model override."""
+        payload = json.dumps(dict(override), ensure_ascii=False, sort_keys=True)
+
+        def _do(conn):
+            conn.execute(
+                """
+                INSERT INTO gateway_session_model_overrides (session_key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(session_key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (session_key, payload, time.time()),
+            )
+
+        self._execute_write(_do)
+
+    def del_gateway_session_model_override(self, session_key: str) -> None:
+        """Delete a gateway session-scoped model override."""
+        def _do(conn):
+            conn.execute(
+                "DELETE FROM gateway_session_model_overrides WHERE session_key = ?",
+                (session_key,),
+            )
+
+        self._execute_write(_do)
+
+    def get_gateway_session_reasoning_overrides(self) -> Dict[str, Dict[str, Any]]:
+        """Return all persisted gateway session-scoped reasoning overrides."""
+        with self._lock:
+            conn = self._conn
+            if conn is None:
+                return {}
+            rows = conn.execute(
+                "SELECT session_key, value FROM gateway_session_reasoning_overrides"
+            ).fetchall()
+        overrides: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            session_key = row["session_key"] if isinstance(row, sqlite3.Row) else row[0]
+            raw = row["value"] if isinstance(row, sqlite3.Row) else row[1]
+            try:
+                value = json.loads(raw)
+            except Exception:
+                continue
+            if isinstance(value, dict):
+                overrides[str(session_key)] = value
+        return overrides
+
+    def set_gateway_session_reasoning_override(
+        self,
+        session_key: str,
+        override: Dict[str, Any],
+    ) -> None:
+        """Persist a gateway session-scoped reasoning override."""
+        payload = json.dumps(dict(override), ensure_ascii=False, sort_keys=True)
+
+        def _do(conn):
+            conn.execute(
+                """
+                INSERT INTO gateway_session_reasoning_overrides (session_key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(session_key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (session_key, payload, time.time()),
+            )
+
+        self._execute_write(_do)
+
+    def del_gateway_session_reasoning_override(self, session_key: str) -> None:
+        """Delete a gateway session-scoped reasoning override."""
+        def _do(conn):
+            conn.execute(
+                "DELETE FROM gateway_session_reasoning_overrides WHERE session_key = ?",
+                (session_key,),
+            )
+
+        self._execute_write(_do)
 
     def close(self):
         """Close the database connection.

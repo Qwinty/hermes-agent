@@ -3070,8 +3070,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Initialize session database for session_search tool support
         self._session_db = None
         try:
-            from hermes_state import AsyncSessionDB, SessionDB
-            self._session_db = AsyncSessionDB(SessionDB())
+            from hermes_state import SessionDB
+            self._session_db = SessionDB()
+            self._load_persisted_session_runtime_overrides()
         except Exception as e:
             # WARNING (not DEBUG) so the failure appears in errors.log — matches
             # cli.py's handling of the same init path.  Users hitting NFS-mounted
@@ -4881,6 +4882,60 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return overrides[resolved_session_key]
         return self._load_reasoning_config()
 
+    def _load_persisted_session_runtime_overrides(self) -> None:
+        """Restore gateway session-scoped model/reasoning overrides from state.db."""
+        session_db = getattr(self, "_session_db", None)
+        if session_db is None:
+            return
+        if not hasattr(self, "_session_model_overrides"):
+            self._session_model_overrides = {}
+        if not hasattr(self, "_session_reasoning_overrides"):
+            self._session_reasoning_overrides = {}
+        try:
+            model_overrides = session_db.get_gateway_session_model_overrides()
+            if isinstance(model_overrides, dict):
+                self._session_model_overrides.update(
+                    {
+                        str(session_key): dict(override)
+                        for session_key, override in model_overrides.items()
+                        if isinstance(override, dict)
+                    }
+                )
+        except Exception as exc:
+            logger.warning("Failed to load persisted model overrides: %s", exc)
+        try:
+            reasoning_overrides = session_db.get_gateway_session_reasoning_overrides()
+            if isinstance(reasoning_overrides, dict):
+                self._session_reasoning_overrides.update(
+                    {
+                        str(session_key): dict(override)
+                        for session_key, override in reasoning_overrides.items()
+                        if isinstance(override, dict)
+                    }
+                )
+        except Exception as exc:
+            logger.warning("Failed to load persisted reasoning overrides: %s", exc)
+
+    def _set_session_model_override(
+        self,
+        session_key: str,
+        model_override: Dict[str, Any],
+    ) -> None:
+        """Set and persist the session-scoped model override."""
+        if not session_key:
+            return
+        if not hasattr(self, "_session_model_overrides"):
+            self._session_model_overrides = {}
+        override = dict(model_override)
+        self._session_model_overrides[session_key] = override
+        session_db = getattr(self, "_session_db", None)
+        if session_db is None:
+            return
+        try:
+            session_db.set_gateway_session_model_override(session_key, override)
+        except Exception as exc:
+            logger.warning("Failed to persist model override for %s: %s", session_key, exc)
+
     def _set_session_reasoning_override(
         self,
         session_key: str,
@@ -4891,10 +4946,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
         if not hasattr(self, "_session_reasoning_overrides"):
             self._session_reasoning_overrides = {}
+        session_db = getattr(self, "_session_db", None)
         if reasoning_config is None:
             self._session_reasoning_overrides.pop(session_key, None)
+            if session_db is not None:
+                try:
+                    session_db.del_gateway_session_reasoning_override(session_key)
+                except Exception as exc:
+                    logger.warning("Failed to delete reasoning override for %s: %s", session_key, exc)
         else:
-            self._session_reasoning_overrides[session_key] = dict(reasoning_config)
+            override = dict(reasoning_config)
+            self._session_reasoning_overrides[session_key] = override
+            if session_db is not None:
+                try:
+                    session_db.set_gateway_session_reasoning_override(session_key, override)
+                except Exception as exc:
+                    logger.warning("Failed to persist reasoning override for %s: %s", session_key, exc)
+
+    def _clear_session_runtime_overrides(self, session_key: str) -> None:
+        """Clear model and reasoning overrides for a gateway session."""
+        if not session_key:
+            return
+        if not hasattr(self, "_session_model_overrides"):
+            self._session_model_overrides = {}
+        if not hasattr(self, "_session_reasoning_overrides"):
+            self._session_reasoning_overrides = {}
+        self._session_model_overrides.pop(session_key, None)
+        self._session_reasoning_overrides.pop(session_key, None)
+        session_db = getattr(self, "_session_db", None)
+        if session_db is None:
+            return
+        try:
+            session_db.del_gateway_session_model_override(session_key)
+        except Exception as exc:
+            logger.warning("Failed to delete model override for %s: %s", session_key, exc)
+        try:
+            session_db.del_gateway_session_reasoning_override(session_key)
+        except Exception as exc:
+            logger.warning("Failed to delete reasoning override for %s: %s", session_key, exc)
 
     @staticmethod
     def _load_service_tier() -> str | None:
@@ -10775,8 +10864,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # session-scoped transient state so the fresh session does not
             # inherit the previous conversation's model/reasoning overrides
             # or a queued "/model switched" note.
-            self._session_model_overrides.pop(session_key, None)
-            self._set_session_reasoning_override(session_key, None)
+            self._clear_session_runtime_overrides(session_key)
             if hasattr(self, "_pending_model_notes"):
                 self._pending_model_notes.pop(session_key, None)
             # Clear per-session model cache so the fresh session resolves
@@ -11791,8 +11879,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 new_entry = self.session_store.reset_session(session_key)
                 self._evict_cached_agent(session_key)
-                self._session_model_overrides.pop(session_key, None)
-                self._set_session_reasoning_override(session_key, None)
+                self._clear_session_runtime_overrides(session_key)
                 if hasattr(self, "_pending_model_notes"):
                     self._pending_model_notes.pop(session_key, None)
                 # Clear per-session model cache so the post-reset turn
@@ -12289,6 +12376,159 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return "\n".join(lines)
 
 
+        # Snapshot the old entry so on_session_finalize can report the
+        # expiring session id before reset_session() rotates it.
+        old_entry = self.session_store._entries.get(session_key)
+
+        # Close tool resources on the old agent (terminal sandboxes, browser
+        # daemons, background processes) before evicting from cache.
+        # Guard with getattr because test fixtures may skip __init__.
+        _cache_lock = getattr(self, "_agent_cache_lock", None)
+        if _cache_lock is not None:
+            with _cache_lock:
+                _cached = self._agent_cache.get(session_key)
+                _old_agent = _cached[0] if isinstance(_cached, tuple) else _cached if _cached else None
+            if _old_agent is not None:
+                self._cleanup_agent_resources(_old_agent)
+        self._evict_cached_agent(session_key)
+
+        # Discard any /queue overflow for this session — /new is a
+        # conversation-boundary operation, queued follow-ups from the
+        # previous conversation must not bleed into the new one.
+        _qe = getattr(self, "_queued_events", None)
+        if _qe is not None:
+            _qe.pop(session_key, None)
+
+        try:
+            from tools.env_passthrough import clear_env_passthrough
+            clear_env_passthrough()
+        except Exception:
+            pass
+
+        try:
+            from tools.credential_files import clear_credential_files
+            clear_credential_files()
+        except Exception:
+            pass
+
+        # Reset the session
+        new_entry = self.session_store.reset_session(session_key)
+
+        # Clear any session-scoped model/reasoning overrides so the next agent
+        # picks up configured defaults instead of previous session switches.
+        self._clear_session_runtime_overrides(session_key)
+        if hasattr(self, "_pending_model_notes"):
+            self._pending_model_notes.pop(session_key, None)
+
+        # Clear session-scoped dangerous-command approvals and /yolo state.
+        # /new is a conversation-boundary operation — approval state from the
+        # previous conversation must not survive the reset.
+        self._clear_session_boundary_security_state(session_key)
+
+        # Fire plugin on_session_finalize hook (session boundary)
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+            _old_sid = old_entry.session_id if old_entry else None
+            _invoke_hook("on_session_finalize", session_id=_old_sid,
+                         platform=source.platform.value if source.platform else "")
+        except Exception:
+            pass
+
+        # Emit session:end hook (session is ending)
+        await self.hooks.emit("session:end", {
+            "platform": source.platform.value if source.platform else "",
+            "user_id": source.user_id,
+            "session_key": session_key,
+        })
+
+        # Emit session:reset hook
+        await self.hooks.emit("session:reset", {
+            "platform": source.platform.value if source.platform else "",
+            "user_id": source.user_id,
+            "session_key": session_key,
+        })
+
+        # Resolve session config info to surface to the user
+        try:
+            session_info = self._format_session_info()
+        except Exception:
+            session_info = ""
+
+        if new_entry:
+            header = self._telegram_topic_new_header(source) or t("gateway.reset.header_default")
+        else:
+            # No existing session, just create one
+            new_entry = self.session_store.get_or_create_session(source, force_new=True)
+            header = self._telegram_topic_new_header(source) or t("gateway.reset.header_new")
+
+        # Set session title if provided with /new <title>
+        _title_arg = event.get_command_args().strip()
+        _title_note = ""
+        if _title_arg and self._session_db and new_entry:
+            from hermes_state import SessionDB
+            try:
+                sanitized = SessionDB.sanitize_title(_title_arg)
+            except ValueError as e:
+                sanitized = None
+                _title_note = t("gateway.reset.title_rejected", error=str(e))
+            if sanitized:
+                try:
+                    self._session_db.set_session_title(new_entry.session_id, sanitized)
+                    header = t("gateway.reset.header_titled", title=sanitized)
+                except ValueError as e:
+                    _title_note = t("gateway.reset.title_error_untitled", error=str(e))
+                except Exception:
+                    pass
+            elif not _title_note:
+                # sanitize_title returned empty (whitespace-only / unprintable)
+                _title_note = t("gateway.reset.title_empty_untitled")
+        header = header + _title_note
+
+        # When /new runs inside a Telegram DM topic lane, rewrite the
+        # (chat_id, thread_id) → session_id binding so the next message
+        # uses the freshly-created session. Without this, the binding
+        # still points at the old session and the binding-lookup at the
+        # top of _handle_message_with_agent would switch right back.
+        if self._is_telegram_topic_lane(source) and new_entry is not None:
+            try:
+                self._record_telegram_topic_binding(source, new_entry)
+            except Exception:
+                logger.debug("Failed to rebind Telegram topic after /new", exc_info=True)
+
+        # Fire plugin on_session_reset hook (new session guaranteed to exist)
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+            _new_sid = new_entry.session_id if new_entry else None
+            _invoke_hook("on_session_reset", session_id=_new_sid,
+                         platform=source.platform.value if source.platform else "")
+        except Exception:
+            pass
+
+        # Append a random tip to the reset message
+        try:
+            from hermes_cli.tips import get_random_tip
+            _tip_line = t("gateway.reset.tip", tip=get_random_tip())
+        except Exception:
+            _tip_line = ""
+
+        if session_info:
+            return EphemeralReply(f"{header}\n\n{session_info}{_tip_line}")
+        return EphemeralReply(f"{header}{_tip_line}")
+
+    async def _handle_profile_command(self, event: MessageEvent) -> str:
+        """Handle /profile — show active profile name and home directory."""
+        from hermes_constants import display_hermes_home
+        from hermes_cli.profiles import get_active_profile_name
+
+        display = display_hermes_home()
+        profile_name = get_active_profile_name()
+
+        lines = [
+            t("gateway.profile.header", profile=profile_name),
+            t("gateway.profile.home", home=display),
+        ]
+
+        return "\n".join(lines)
 
 
     def _check_slash_access(
@@ -12466,7 +12706,277 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         args = (event.get_command_args() or "").strip()
         source = event.source
-        origin = None
+        session_key = self._session_key_for_source(source)
+        override = self._session_model_overrides.get(session_key, {})
+        if override:
+            current_model = override.get("model", current_model)
+            current_provider = override.get("provider", current_provider)
+            current_base_url = override.get("base_url", current_base_url)
+            current_api_key = override.get("api_key", current_api_key)
+
+        # No args: show interactive picker (Telegram/Discord) or text list
+        if not model_input and not explicit_provider:
+            # Try interactive picker if the platform supports it
+            adapter = self.adapters.get(source.platform)
+            has_picker = (
+                adapter is not None
+                and getattr(type(adapter), "send_model_picker", None) is not None
+            )
+
+            if has_picker:
+                try:
+                    providers = list_picker_providers(
+                        current_provider=current_provider,
+                        current_base_url=current_base_url,
+                        current_model=current_model,
+                        user_providers=user_provs,
+                        custom_providers=custom_provs,
+                        max_models=50,
+                    )
+                except Exception:
+                    providers = []
+
+                if providers:
+                    # Build a callback closure for when the user picks a model.
+                    # Captures self + locals needed for the switch logic.
+                    _self = self
+                    _session_key = session_key
+                    _cur_model = current_model
+                    _cur_provider = current_provider
+                    _cur_base_url = current_base_url
+                    _cur_api_key = current_api_key
+
+                    async def _on_model_selected(
+                        _chat_id: str, model_id: str, provider_slug: str
+                    ) -> str:
+                        """Perform the model switch and return confirmation text."""
+                        result = _switch_model(
+                            raw_input=model_id,
+                            current_provider=_cur_provider,
+                            current_model=_cur_model,
+                            current_base_url=_cur_base_url,
+                            current_api_key=_cur_api_key,
+                            is_global=False,
+                            explicit_provider=provider_slug,
+                            user_providers=user_provs,
+                            custom_providers=custom_provs,
+                        )
+                        if not result.success:
+                            return t("gateway.model.error_prefix", error=result.error_message)
+
+                        # Update cached agent in-place
+                        cached_entry = None
+                        _cache_lock = getattr(_self, "_agent_cache_lock", None)
+                        _cache = getattr(_self, "_agent_cache", None)
+                        if _cache_lock and _cache is not None:
+                            with _cache_lock:
+                                cached_entry = _cache.get(_session_key)
+                        if cached_entry and cached_entry[0] is not None:
+                            try:
+                                cached_entry[0].switch_model(
+                                    new_model=result.new_model,
+                                    new_provider=result.target_provider,
+                                    api_key=result.api_key,
+                                    base_url=result.base_url,
+                                    api_mode=result.api_mode,
+                                )
+                            except Exception as exc:
+                                logger.warning("Picker model switch failed for cached agent: %s", exc)
+
+                        # Store model note + session override
+                        if not hasattr(_self, "_pending_model_notes"):
+                            _self._pending_model_notes = {}
+                        _self._pending_model_notes[_session_key] = (
+                            f"[Note: model was just switched from {_cur_model} to {result.new_model} "
+                            f"via {result.provider_label or result.target_provider}. "
+                            f"Adjust your self-identification accordingly.]"
+                        )
+                        _self._set_session_model_override(
+                            _session_key,
+                            {
+                                "model": result.new_model,
+                                "provider": result.target_provider,
+                                "api_key": result.api_key,
+                                "base_url": result.base_url,
+                                "api_mode": result.api_mode,
+                            },
+                        )
+
+                        # Evict cached agent so the next turn creates a fresh
+                        # agent from the override rather than relying on the
+                        # stale cache signature to trigger a rebuild.
+                        _self._evict_cached_agent(_session_key)
+
+                        # Build confirmation text
+                        plabel = result.provider_label or result.target_provider
+                        lines = [t("gateway.model.switched", model=result.new_model)]
+                        lines.append(t("gateway.model.provider_label", provider=plabel))
+                        mi = result.model_info
+                        from hermes_cli.model_switch import resolve_display_context_length
+                        _sw_config_ctx = None
+                        try:
+                            _sw_cfg = _load_gateway_config()
+                            _sw_model_cfg = _sw_cfg.get("model", {})
+                            if isinstance(_sw_model_cfg, dict):
+                                _sw_raw = _sw_model_cfg.get("context_length")
+                                if _sw_raw is not None:
+                                    _sw_config_ctx = int(_sw_raw)
+                        except Exception:
+                            pass
+                        ctx = resolve_display_context_length(
+                            result.new_model,
+                            result.target_provider,
+                            base_url=result.base_url or current_base_url or "",
+                            api_key=result.api_key or current_api_key or "",
+                            model_info=mi,
+                            custom_providers=custom_provs,
+                            config_context_length=_sw_config_ctx,
+                        )
+                        if ctx:
+                            lines.append(t("gateway.model.context_label", tokens=f"{ctx:,}"))
+                        if mi:
+                            if mi.max_output:
+                                lines.append(t("gateway.model.max_output_label", tokens=f"{mi.max_output:,}"))
+                            if mi.has_cost_data():
+                                lines.append(t("gateway.model.cost_label", cost=mi.format_cost()))
+                            lines.append(t("gateway.model.capabilities_label", capabilities=mi.format_capabilities()))
+                        lines.append(t("gateway.model.session_only_hint"))
+                        return "\n".join(lines)
+
+                    metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+                    result = await adapter.send_model_picker(
+                        chat_id=source.chat_id,
+                        providers=providers,
+                        current_model=current_model,
+                        current_provider=current_provider,
+                        session_key=session_key,
+                        on_model_selected=_on_model_selected,
+                        metadata=metadata,
+                    )
+                    if result.success:
+                        return None  # Picker sent — adapter handles the response
+
+            # Fallback: text list (for platforms without picker or if picker failed)
+            provider_label = get_label(current_provider)
+            lines = [t("gateway.model.current_label", model=current_model or "unknown", provider=provider_label), ""]
+
+            try:
+                providers = list_authenticated_providers(
+                    current_provider=current_provider,
+                    current_base_url=current_base_url,
+                    current_model=current_model,
+                    user_providers=user_provs,
+                    custom_providers=custom_provs,
+                    max_models=5,
+                )
+                for p in providers:
+                    tag = t("gateway.model.current_tag") if p["is_current"] else ""
+                    lines.append(f"**{p['name']}** `--provider {p['slug']}`{tag}:")
+                    if p["models"]:
+                        model_strs = ", ".join(f"`{m}`" for m in p["models"])
+                        extra = t("gateway.model.more_models_suffix", count=p["total_models"] - len(p["models"])) if p["total_models"] > len(p["models"]) else ""
+                        lines.append(f"  {model_strs}{extra}")
+                    elif p.get("api_url"):
+                        lines.append(f"  `{p['api_url']}`")
+                    lines.append("")
+            except Exception:
+                pass
+
+            lines.append(t("gateway.model.usage_switch_model"))
+            lines.append(t("gateway.model.usage_switch_provider"))
+            lines.append(t("gateway.model.usage_persist"))
+            return "\n".join(lines)
+
+        # Perform the switch
+        result = _switch_model(
+            raw_input=model_input,
+            current_provider=current_provider,
+            current_model=current_model,
+            current_base_url=current_base_url,
+            current_api_key=current_api_key,
+            is_global=persist_global,
+            explicit_provider=explicit_provider,
+            user_providers=user_provs,
+            custom_providers=custom_provs,
+        )
+
+        if not result.success:
+            return t("gateway.model.error_prefix", error=result.error_message)
+
+        # If there's a cached agent, update it in-place
+        cached_entry = None
+        _cache_lock = getattr(self, "_agent_cache_lock", None)
+        _cache = getattr(self, "_agent_cache", None)
+        if _cache_lock and _cache is not None:
+            with _cache_lock:
+                cached_entry = _cache.get(session_key)
+
+        if cached_entry and cached_entry[0] is not None:
+            try:
+                cached_entry[0].switch_model(
+                    new_model=result.new_model,
+                    new_provider=result.target_provider,
+                    api_key=result.api_key,
+                    base_url=result.base_url,
+                    api_mode=result.api_mode,
+                )
+            except Exception as exc:
+                logger.warning("In-place model switch failed for cached agent: %s", exc)
+
+        # Store a note to prepend to the next user message so the model
+        # knows about the switch (avoids system messages mid-history).
+        if not hasattr(self, "_pending_model_notes"):
+            self._pending_model_notes = {}
+        self._pending_model_notes[session_key] = (
+            f"[Note: model was just switched from {current_model} to {result.new_model} "
+            f"via {result.provider_label or result.target_provider}. "
+            f"Adjust your self-identification accordingly.]"
+        )
+
+        # Store session override so next agent creation uses the new model
+        self._set_session_model_override(
+            session_key,
+            {
+                "model": result.new_model,
+                "provider": result.target_provider,
+                "api_key": result.api_key,
+                "base_url": result.base_url,
+                "api_mode": result.api_mode,
+            },
+        )
+
+        # Evict cached agent so the next turn creates a fresh agent from the
+        # override rather than relying on cache signature mismatch detection.
+        self._evict_cached_agent(session_key)
+
+        # Persist to config if --global
+        if persist_global:
+            try:
+                if config_path.exists():
+                    with open(config_path, encoding="utf-8") as f:
+                        cfg = yaml.safe_load(f) or {}
+                else:
+                    cfg = {}
+                model_cfg = cfg.setdefault("model", {})
+                model_cfg["default"] = result.new_model
+                model_cfg["provider"] = result.target_provider
+                if result.base_url:
+                    model_cfg["base_url"] = result.base_url
+                from hermes_cli.config import save_config
+                save_config(cfg)
+            except Exception as e:
+                logger.warning("Failed to persist model switch: %s", e)
+
+        # Build confirmation message with full metadata
+        provider_label = result.provider_label or result.target_provider
+        lines = [t("gateway.model.switched", model=result.new_model)]
+        lines.append(t("gateway.model.provider_label", provider=provider_label))
+
+        # Context: always resolve via the provider-aware chain so Codex OAuth,
+        # Copilot, and Nous-enforced caps win over the raw models.dev entry.
+        mi = result.model_info
+        from hermes_cli.model_switch import resolve_display_context_length
+        _sw2_config_ctx = None
         try:
             platform = getattr(source.platform, "value", None) or str(getattr(source, "platform", "") or "")
             chat_id = getattr(source, "chat_id", None)
