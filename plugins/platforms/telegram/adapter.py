@@ -8720,6 +8720,20 @@ class TelegramAdapter(BasePlatformAdapter):
             _chat_id_str if thread_id_str else None,
         )
 
+        # Guest-mode routing is a Telegram group/supergroup direct @mention
+        # while telegram.guest_mode is enabled.  Preserve this on the event so
+        # the gateway can choose a dedicated guest model without affecting the
+        # owner's normal DM/topic sessions.
+        _guest_mode_invocation = False
+        try:
+            _guest_mode_invocation = (
+                chat_type == "group"
+                and self._telegram_guest_mode()
+                and self._message_mentions_bot(message)
+            )
+        except Exception:
+            _guest_mode_invocation = False
+
         return MessageEvent(
             text=message.text or "",
             message_type=msg_type,
@@ -8731,6 +8745,7 @@ class TelegramAdapter(BasePlatformAdapter):
             reply_to_text=reply_to_text,
             auto_skill=topic_skill,
             channel_prompt=_channel_prompt,
+            guest_mode_invocation=_guest_mode_invocation,
             timestamp=message.date,
         )
 
