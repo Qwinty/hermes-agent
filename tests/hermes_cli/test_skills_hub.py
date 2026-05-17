@@ -676,6 +676,7 @@ def test_do_list_matches_hub_entry_by_installed_frontmatter_name(monkeypatch, tm
     )
     monkeypatch.setattr(skills_sync, "_read_manifest", lambda: {})
 
+
     output = _capture()
 
     assert "here.now" in output
