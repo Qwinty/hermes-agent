@@ -3659,6 +3659,34 @@ class AIAgent:
         return copy_reasoning_content_for_api(self, source_msg, api_msg)
 
     @staticmethod
+    def _strip_provider_reasoning_state(messages: Optional[list]) -> int:
+        """Remove provider-specific reasoning continuity blobs from assistant turns.
+
+        Some providers persist opaque state that must only be replayed back to the
+        same backend on the next turn:
+        - ``reasoning_details``
+        - ``codex_reasoning_items``
+        - ``codex_message_items``
+
+        When a session switches providers mid-conversation, replaying those blobs
+        into a different backend can trigger 400s.
+
+        Returns the number of fields removed across all assistant messages.
+        """
+        if not isinstance(messages, list):
+            return 0
+
+        stripped = 0
+        for msg in messages:
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            for key in ("reasoning_details", "codex_reasoning_items", "codex_message_items"):
+                if key in msg:
+                    msg.pop(key, None)
+                    stripped += 1
+        return stripped
+
+    @staticmethod
     def _sanitize_tool_calls_for_strict_api(api_msg: dict) -> dict:
         """Strip Codex Responses API fields from tool_calls for strict providers.
 
