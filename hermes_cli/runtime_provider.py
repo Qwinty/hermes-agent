@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from urllib.parse import urlparse
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -133,120 +133,101 @@ def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
     return None
 
 
-def _resolve_plain_custom_api_mode(model_cfg: Dict[str, Any], base_url: str) -> str:
-    """Resolve api_mode for legacy/plain ``provider: custom`` endpoints.
+def _epoch_seconds(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            pass
+        try:
+            normalized = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+            return datetime.fromisoformat(normalized).timestamp()
+        except ValueError:
+            return None
+    return None
 
-    Custom endpoints should stay conservative by default. Only direct OpenAI/xAI
-    URLs imply Responses API automatically; named custom providers can opt in via
-    their own ``api_mode`` field. This also prevents a stale persisted
-    ``model.api_mode: codex_responses`` from forcing generic relays onto the
-    Responses path after upgrades or /reset.
-    """
-    configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
-    detected_mode = _detect_api_mode_for_url(base_url)
 
-    if configured_mode == "codex_responses" and detected_mode != "codex_responses":
-        logger.info(
-            "Ignoring persisted custom api_mode=codex_responses for non-OpenAI endpoint %s",
-            base_url or "(unknown)",
+def _format_epoch_utc(value: float) -> str:
+    return (
+        datetime.fromtimestamp(value, tz=timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def _pool_entry_retry_at(entry: Any) -> Optional[float]:
+    reset_at = _epoch_seconds(getattr(entry, "last_error_reset_at", None))
+    if reset_at is not None:
+        return reset_at
+
+    status_at = _epoch_seconds(getattr(entry, "last_status_at", None))
+    if status_at is None:
+        return None
+
+    try:
+        status_code = int(getattr(entry, "last_error_code", 0) or 0)
+    except (TypeError, ValueError):
+        status_code = 0
+
+    ttl = 5 * 60 if status_code == 401 else 60 * 60
+    return status_at + ttl
+
+
+def _credential_pool_exhausted_error(provider: str, pool: CredentialPool) -> AuthError:
+    entries = []
+    try:
+        entries = list(pool.entries())
+    except Exception:
+        entries = []
+
+    count = len(entries)
+    plural = "entry" if count == 1 else "entries"
+    retry_candidates: list[tuple[float, str]] = []
+    reasons: list[str] = []
+
+    for idx, entry in enumerate(entries, start=1):
+        label = (
+            str(getattr(entry, "label", "") or "").strip()
+            or str(getattr(entry, "id", "") or "").strip()
+            or f"#{idx}"
         )
-        configured_mode = None
+        retry_at = _pool_entry_retry_at(entry)
+        if retry_at is not None:
+            retry_candidates.append((retry_at, label))
+        reason = (
+            str(getattr(entry, "last_error_reason", "") or "").strip()
+            or str(getattr(entry, "last_error_message", "") or "").strip()
+        )
+        if reason and len(reasons) < 2:
+            reasons.append(f"{label}: {reason}")
 
-    return configured_mode or detected_mode or "chat_completions"
-
-
-def _host_derived_api_key(base_url: str) -> str:
-    """Look up `<VENDOR>_API_KEY` in the env, derived from the base URL host.
-
-    Examples:
-        https://api.deepseek.com/v1   → DEEPSEEK_API_KEY
-        https://api.groq.com/openai/v1 → GROQ_API_KEY
-        https://api.mistral.ai/v1     → MISTRAL_API_KEY
-        https://generativelanguage.googleapis.com/v1beta/openai/ → GOOGLEAPIS_API_KEY
-
-    Returns the env value (stripped) or "". Never returns env vars whose names
-    are already explicitly checked elsewhere — those are handled by their own
-    host-gated paths (OPENAI/OPENROUTER/OLLAMA).
-
-    The vendor label is the *registrable* portion of the hostname: strip
-    ``api.`` / ``www.`` prefixes, then take the second-to-last label
-    (``api.deepseek.com`` → ``deepseek``). Falls back to "" for hostnames
-    that don't yield a usable vendor label (IPs, loopback, single-label
-    hosts).
-    """
-    hostname = base_url_hostname(base_url)
-    if not hostname:
-        return ""
-    # Reject IPv4 / IPv6 / loopback — no meaningful vendor label.
-    if any(ch.isdigit() for ch in hostname.split(".")[-1]):
-        # Last label starts with a digit → likely IP. (TLDs are never numeric.)
-        return ""
-    if hostname in ("localhost",) or ":" in hostname:
-        return ""
-    labels = [lbl for lbl in hostname.split(".") if lbl]
-    # Strip common API/CDN prefixes.
-    while labels and labels[0] in ("api", "www"):
-        labels.pop(0)
-    if len(labels) < 2:
-        return ""
-    # Take the *registrable* label (second-to-last). For typical provider
-    # hosts this is what users intuitively call "the vendor":
-    #   deepseek.com               → labels[-2] = "deepseek"  ✓
-    #   api.groq.com → groq.com    → labels[-2] = "groq"      ✓
-    #   api.mistral.ai             → labels[-2] = "mistral"   ✓
-    # Crucially, lookalike hosts pick the ATTACKER's label, not the spoofed
-    # vendor:
-    #   api.deepseek.com.attacker.test → labels[-2] = "attacker"
-    # so DEEPSEEK_API_KEY stays put and the chain falls through to
-    # no-key-required. This mirrors how `base_url_host_matches` resists the
-    # same lookalike attack for explicit hosts.
-    vendor = labels[-2]
-    # Sanitize to env var charset: A-Z, 0-9, underscore.
-    sanitized = "".join(ch if ch.isalnum() else "_" for ch in vendor).upper()
-    if not sanitized or not sanitized[0].isalpha():
-        return ""
-    # Don't re-derive env vars already handled by explicit host-gated paths.
-    if sanitized in ("OPENAI", "OPENROUTER", "OLLAMA"):
-        return ""
-    env_name = f"{sanitized}_API_KEY"
-    return (_getenv(env_name, "") or "").strip()
-
-
-def _anthropic_base_url_override_ok(base_url: str) -> bool:
-    """Decide whether a configured ``model.base_url`` may back native Anthropic.
-
-    Native ``provider: anthropic`` resolution honors ``model.base_url`` so users
-    can point at Anthropic-compatible endpoints (official Anthropic/Claude hosts,
-    Azure Foundry, MiniMax/Zhipu/LiteLLM-style ``/anthropic`` proxies, Kimi's
-    ``/coding`` route). But a config can carry a *stale* non-Anthropic URL — e.g.
-    ``provider: anthropic`` left with ``base_url: https://openrouter.ai/api/v1``
-    after a provider switch — which would route Anthropic OAuth/setup-token
-    traffic to an OpenAI-compatible aggregator and 404. Ignore those.
-
-    Returns True only when the URL plausibly speaks the Anthropic Messages
-    protocol; otherwise the caller falls back to ``https://api.anthropic.com``.
-    """
-    candidate = (base_url or "").strip()
-    if not candidate:
-        return False
-
-    hostname = (base_url_hostname(candidate) or "").lower()
-    if not hostname:
-        return False
-
-    # Official Anthropic / Claude hosts.
-    if hostname == "api.anthropic.com" or hostname.endswith(".anthropic.com") or hostname.endswith(".claude.com"):
-        return True
-    # Azure Foundry Anthropic endpoints (handled specially downstream).
-    if hostname.endswith(".azure.com"):
-        return True
-    # Anthropic-compatible proxies conventionally expose the native Messages
-    # protocol under a ``/anthropic`` suffix, and Kimi under ``/coding`` — same
-    # signal _detect_api_mode_for_url() uses to pick anthropic_messages.
-    if _detect_api_mode_for_url(candidate) == "anthropic_messages":
-        return True
-    # Bare api.kimi.com without the /coding path is not an Anthropic endpoint.
-    return False
+    message = (
+        f"All {count or 'configured'} {provider} credential pool {plural} "
+        "are unavailable; same-provider rotation has no usable credential left."
+    )
+    if retry_candidates:
+        retry_at, label = min(retry_candidates, key=lambda item: item[0])
+        message += f" Next retry window: {label} at {_format_epoch_utc(retry_at)}."
+    if reasons:
+        message += " Last pool errors: " + "; ".join(reasons) + "."
+    message += (
+        f" Run `hermes auth list {provider}` to inspect the pool, "
+        f"`hermes auth reset {provider}` after quotas reset or re-authentication, "
+        "or configure `fallback_providers` for cross-provider fallback."
+    )
+    return AuthError(
+        message,
+        provider=provider,
+        code="credential_pool_exhausted",
+    )
 
 
 def _auto_detect_local_model(base_url: str) -> str:
@@ -1685,63 +1666,55 @@ def resolve_runtime_provider(
             and not has_runtime_override
         )
 
+    pool_unavailable = False
     try:
         pool = load_pool(provider) if should_use_pool else None
     except Exception:
         pool = None
     if pool and pool.has_credentials():
         entry = pool.select()
-        pool_api_key = ""
-        if entry is not None:
+        if entry is None:
+            pool_error = _credential_pool_exhausted_error(provider, pool)
+            if requested_provider != "auto":
+                raise pool_error
+            logger.info(
+                "Auto-detected %s credential pool is exhausted; "
+                "falling through to environment/default providers.",
+                provider,
+            )
+            pool_unavailable = True
+        else:
             pool_api_key = (
                 getattr(entry, "runtime_api_key", None)
                 or getattr(entry, "access_token", "")
             )
-        # For Nous, the pool entry's runtime_api_key is the agent_key
-        # compatibility field. It must be an invoke JWT. The pool doesn't
-        # refresh it during selection (that would trigger network calls in
-        # non-runtime contexts like `hermes auth list`). If the key is
-        # expired/missing, refresh the selected pool entry before falling back
-        # to singleton auth resolution.
-        if provider == "nous" and entry is not None:
-            min_ttl = max(60, env_int("HERMES_NOUS_MIN_KEY_TTL_SECONDS", 1800))
-            nous_state = {
-                "agent_key": getattr(entry, "agent_key", None),
-                "agent_key_expires_at": getattr(entry, "agent_key_expires_at", None),
-                "scope": getattr(entry, "scope", None),
-            }
-            if not _agent_key_is_usable(nous_state, min_ttl):
-                logger.debug("Nous pool entry agent_key expired/missing, refreshing selected pool entry")
-                try:
-                    refreshed = pool.try_refresh_current()
-                except Exception as exc:
-                    logger.debug("Nous pool entry refresh failed: %s", exc)
-                    refreshed = None
-                if refreshed is not None:
-                    entry = refreshed
-                    pool_api_key = (
-                        getattr(entry, "runtime_api_key", None)
-                        or getattr(entry, "access_token", "")
-                    )
-                    nous_state = {
-                        "agent_key": getattr(entry, "agent_key", None),
-                        "agent_key_expires_at": getattr(entry, "agent_key_expires_at", None),
-                        "scope": getattr(entry, "scope", None),
-                    }
-                if not pool_api_key or not _agent_key_is_usable(nous_state, min_ttl):
-                    logger.debug("Nous pool entry agent_key still unavailable, falling through to runtime resolution")
+            # For Nous, the pool entry's runtime_api_key is the agent_key — a
+            # short-lived inference credential (~30 min TTL).  The pool doesn't
+            # refresh it during selection (that would trigger network calls in
+            # non-runtime contexts like `hermes auth list`).  If the key is
+            # expired, clear pool_api_key so we fall through to
+            # resolve_nous_runtime_credentials() which handles refresh + fallback.
+            if provider == "nous" and pool_api_key:
+                min_ttl = max(60, int(os.getenv("HERMES_NOUS_MIN_KEY_TTL_SECONDS", "1800")))
+                nous_state = {
+                    "agent_key": getattr(entry, "agent_key", None),
+                    "agent_key_expires_at": getattr(entry, "agent_key_expires_at", None),
+                    "scope": getattr(entry, "scope", None),
+                }
+                if not _agent_key_is_usable(nous_state, min_ttl):
+                    logger.debug("Nous pool entry agent_key expired/missing, falling through to runtime resolution")
                     pool_api_key = ""
-        if entry is not None and pool_api_key:
-            return _resolve_runtime_from_pool_entry(
-                provider=provider,
-                entry=entry,
-                requested_provider=requested_provider,
-                model_cfg=model_cfg,
-                pool=pool,
-                target_model=target_model,
-            )
+            if pool_api_key:
+                return _resolve_runtime_from_pool_entry(
+                    provider=provider,
+                    entry=entry,
+                    requested_provider=requested_provider,
+                    model_cfg=model_cfg,
+                    pool=pool,
+                    target_model=target_model,
+                )
 
-    if provider == "nous":
+    if provider == "nous" and not pool_unavailable:
         try:
             creds = resolve_nous_runtime_credentials(
                 timeout_seconds=float(_getenv("HERMES_NOUS_TIMEOUT_SECONDS", "15")),
@@ -1763,7 +1736,7 @@ def resolve_runtime_provider(
             logger.info("Auto-detected Nous provider but credentials failed; "
                         "falling through to next provider.")
 
-    if provider == "openai-codex":
+    if provider == "openai-codex" and not pool_unavailable:
         try:
             creds = resolve_codex_runtime_credentials()
             return {
@@ -1783,7 +1756,7 @@ def resolve_runtime_provider(
             logger.info("Auto-detected Codex provider but credentials failed; "
                         "falling through to next provider.")
 
-    if provider == "xai-oauth":
+    if provider == "xai-oauth" and not pool_unavailable:
         try:
             creds = resolve_xai_oauth_runtime_credentials()
             return {
@@ -1801,7 +1774,7 @@ def resolve_runtime_provider(
             logger.info("Auto-detected xAI OAuth provider but credentials failed; "
                         "falling through to next provider.")
 
-    if provider == "qwen-oauth":
+    if provider == "qwen-oauth" and not pool_unavailable:
         try:
             creds = resolve_qwen_runtime_credentials()
             return {
@@ -1819,7 +1792,7 @@ def resolve_runtime_provider(
             logger.info("Qwen OAuth credentials failed; "
                         "falling through to next provider.")
 
-    if provider == "minimax-oauth":
+    if provider == "minimax-oauth" and not pool_unavailable:
         pconfig = PROVIDER_REGISTRY.get(provider)
         if pconfig and pconfig.auth_type == "oauth_minimax":
             from hermes_cli.auth import resolve_minimax_oauth_runtime_credentials
@@ -1832,6 +1805,26 @@ def resolve_runtime_provider(
                 "source": creds.get("source", "oauth"),
                 "requested_provider": requested_provider,
             }
+
+    if provider == "google-gemini-cli" and not pool_unavailable:
+        try:
+            creds = resolve_gemini_oauth_runtime_credentials()
+            return {
+                "provider": "google-gemini-cli",
+                "api_mode": "chat_completions",
+                "base_url": creds.get("base_url", ""),
+                "api_key": creds.get("api_key", ""),
+                "source": creds.get("source", "google-oauth"),
+                "expires_at_ms": creds.get("expires_at_ms"),
+                "email": creds.get("email", ""),
+                "project_id": creds.get("project_id", ""),
+                "requested_provider": requested_provider,
+            }
+        except AuthError:
+            if requested_provider != "auto":
+                raise
+            logger.info("Google Gemini OAuth credentials failed; "
+                        "falling through to next provider.")
 
     if provider == "copilot-acp":
         creds = resolve_external_process_provider_credentials(provider)
