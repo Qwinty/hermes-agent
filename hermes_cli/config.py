@@ -1361,6 +1361,8 @@ DEFAULT_CONFIG = {
         "reactions": False,            # Add 👀/✅/❌ reactions to messages during processing
         "channel_prompts": {},         # Per-chat/topic ephemeral system prompts (topics inherit from parent group)
         "allowed_chats": "",           # If set, bot ONLY responds in these group/supergroup chat IDs (whitelist)
+        "guest_mode": False,           # Allow explicit @mentions from non-allowlisted Telegram groups
+        "guest_mode_model": {},        # Dedicated model for Telegram guest-mode calls: {provider, model}
     },
 
     # Mattermost platform settings (gateway mode)

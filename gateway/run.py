@@ -1850,12 +1850,104 @@ class GatewayRunner:
             session_id=session_entry.session_id,
         )
 
+    def _parse_telegram_guest_mode_model_config(
+        self,
+        user_config: Optional[dict],
+    ) -> Optional[dict]:
+        """Return normalized telegram.guest_mode_model config, if present."""
+        telegram_cfg = (user_config or {}).get("telegram") or {}
+        if not isinstance(telegram_cfg, dict):
+            return None
+        raw = telegram_cfg.get("guest_mode_model") or telegram_cfg.get("guest_model")
+        if raw in (None, "", {}):
+            return None
+
+        if isinstance(raw, dict):
+            provider = str(raw.get("provider") or raw.get("provider_slug") or "").strip()
+            model = str(raw.get("model") or raw.get("default") or raw.get("name") or "").strip()
+            base_url = str(raw.get("base_url") or raw.get("api") or raw.get("url") or "").strip()
+            api_key = str(raw.get("api_key") or "").strip()
+            api_mode = str(raw.get("api_mode") or raw.get("transport") or "").strip()
+            if not (provider or model or base_url):
+                return None
+            return {
+                "provider": provider,
+                "model": model,
+                "base_url": base_url,
+                "api_key": api_key,
+                "api_mode": api_mode,
+            }
+
+        if isinstance(raw, str):
+            value = raw.strip()
+            if not value:
+                return None
+            provider = ""
+            model = value
+            # Compact form for named custom providers:
+            #   custom:CommandCode/deepseek-v4-pro
+            if value.lower().startswith("custom:") and "/" in value:
+                provider, model = value.rsplit("/", 1)
+            return {
+                "provider": provider.strip(),
+                "model": model.strip(),
+                "base_url": "",
+                "api_key": "",
+                "api_mode": "",
+            }
+
+        return None
+
+    def _apply_telegram_guest_mode_model_override(
+        self,
+        *,
+        user_config: Optional[dict],
+        model: str,
+        runtime_kwargs: dict,
+    ) -> tuple[str, dict]:
+        """Apply telegram.guest_mode_model to guest-mode Telegram invocations."""
+        guest_cfg = self._parse_telegram_guest_mode_model_config(user_config)
+        if not guest_cfg:
+            return model, runtime_kwargs
+
+        guest_model = guest_cfg.get("model") or model
+        guest_provider = guest_cfg.get("provider") or runtime_kwargs.get("provider") or ""
+        try:
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+            runtime = resolve_runtime_provider(
+                requested=guest_provider or None,
+                explicit_base_url=guest_cfg.get("base_url") or None,
+                explicit_api_key=guest_cfg.get("api_key") or None,
+                target_model=guest_model,
+            )
+            resolved_runtime = {
+                "api_key": runtime.get("api_key"),
+                "base_url": runtime.get("base_url"),
+                "provider": runtime.get("provider"),
+                "api_mode": guest_cfg.get("api_mode") or runtime.get("api_mode"),
+                "command": runtime.get("command"),
+                "args": list(runtime.get("args") or []),
+                "credential_pool": runtime.get("credential_pool"),
+            }
+            resolved_model = guest_model or runtime.get("model") or model
+            logger.info(
+                "Telegram guest-mode model override: %s/%s -> %s/%s",
+                runtime_kwargs.get("provider"), model,
+                resolved_runtime.get("provider"), resolved_model,
+            )
+            return resolved_model, resolved_runtime
+        except Exception as exc:
+            logger.warning("Failed to apply telegram.guest_mode_model override: %s", exc)
+            return model, runtime_kwargs
+
     def _resolve_session_agent_runtime(
         self,
         *,
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
         user_config: Optional[dict] = None,
+        guest_mode_invocation: bool = False,
     ) -> tuple[str, dict]:
         """Resolve model/runtime for a session, honoring session-scoped /model overrides.
 
@@ -1910,6 +2002,12 @@ class GatewayRunner:
                 runtime_model,
             )
             model = runtime_model
+        if guest_mode_invocation and not override:
+            model, runtime_kwargs = self._apply_telegram_guest_mode_model_override(
+                user_config=user_config,
+                model=model,
+                runtime_kwargs=runtime_kwargs,
+            )
         if override and resolved_session_key:
             model, runtime_kwargs = self._apply_session_model_override(
                 resolved_session_key, model, runtime_kwargs
@@ -7933,6 +8031,7 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
+                guest_mode_invocation=bool(getattr(event, "guest_mode_invocation", False)),
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -14790,6 +14889,7 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        guest_mode_invocation: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -15480,6 +15580,7 @@ class GatewayRunner:
                     source=source,
                     session_key=session_key,
                     user_config=user_config,
+                    guest_mode_invocation=guest_mode_invocation,
                 )
                 logger.debug(
                     "run_agent resolved: model=%s provider=%s session=%s",
@@ -16820,6 +16921,7 @@ class GatewayRunner:
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    guest_mode_invocation=guest_mode_invocation,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
