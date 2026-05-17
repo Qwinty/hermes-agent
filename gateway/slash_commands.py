@@ -181,8 +181,7 @@ class GatewaySlashCommandsMixin:
 
         # Clear any session-scoped model/reasoning overrides so the next agent
         # picks up configured defaults instead of previous session switches.
-        self._session_model_overrides.pop(session_key, None)
-        self._set_session_reasoning_override(session_key, None)
+        self._clear_session_runtime_overrides(session_key)
         if hasattr(self, "_pending_model_notes"):
             self._pending_model_notes.pop(session_key, None)
 
@@ -1324,13 +1323,16 @@ class GatewaySlashCommandsMixin:
                             f"via {result.provider_label or result.target_provider}. "
                             f"Adjust your self-identification accordingly.]"
                         )
-                        _self._session_model_overrides[_session_key] = {
-                            "model": result.new_model,
-                            "provider": result.target_provider,
-                            "api_key": result.api_key,
-                            "base_url": result.base_url,
-                            "api_mode": result.api_mode,
-                        }
+                        _self._set_session_model_override(
+                            _session_key,
+                            {
+                                "model": result.new_model,
+                                "provider": result.target_provider,
+                                "api_key": result.api_key,
+                                "base_url": result.base_url,
+                                "api_mode": result.api_mode,
+                            },
+                        )
 
                         # Evict cached agent so the next turn creates a fresh
                         # agent from the override rather than relying on the
@@ -1654,6 +1656,18 @@ class GatewaySlashCommandsMixin:
                 lines.append(t("gateway.model.saved_global"))
             else:
                 lines.append(t("gateway.model.session_only_hint"))
+
+            # Store session override so next agent creation uses the new model
+            self._set_session_model_override(
+                session_key,
+                {
+                    "model": result.new_model,
+                    "provider": result.target_provider,
+                    "api_key": result.api_key,
+                    "base_url": result.base_url,
+                    "api_mode": result.api_mode,
+                },
+            )
 
             return "\n".join(lines)
 
