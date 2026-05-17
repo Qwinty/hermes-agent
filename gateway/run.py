@@ -7776,8 +7776,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # session is still alive and a resumed turn rebuilds
                         # its agent from these overrides. Only true session
                         # finalization, /new, and /reset clear them.)
-                        self._session_model_overrides.pop(key, None)
-                        self._set_session_reasoning_override(key, None)
+                        self._clear_session_runtime_overrides(key)
                         if hasattr(self, "_pending_model_notes"):
                             self._pending_model_notes.pop(key, None)
                         # Clear per-session model cache so a resumed turn
