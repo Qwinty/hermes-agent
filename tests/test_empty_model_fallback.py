@@ -134,6 +134,75 @@ class TestGatewayEmptyModelFallback:
         # Can't fill in a default without knowing the provider
         assert model == ""
 
+    def test_telegram_guest_mode_model_overrides_runtime(self):
+        """Telegram guest-mode calls can use a dedicated model/provider."""
+        from gateway.run import GatewayRunner
+
+        runner = object.__new__(GatewayRunner)
+        runner._session_model_overrides = {}
+        user_config = {
+            "telegram": {
+                "guest_mode_model": {
+                    "provider": "custom:CommandCode",
+                    "model": "deepseek-v4-pro",
+                },
+            },
+        }
+
+        with patch("gateway.run._resolve_gateway_model", return_value="gpt-5.5"), \
+             patch("gateway.run._resolve_runtime_agent_kwargs", return_value={
+                 "provider": "openai-codex",
+                 "api_key": "codex-key",
+                 "base_url": "https://chatgpt.com/backend-api/codex",
+                 "api_mode": "codex_responses",
+             }), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider", return_value={
+                 "provider": "custom",
+                 "api_key": "dummy",
+                 "base_url": "http://127.0.0.1:8099/v1",
+                 "api_mode": "chat_completions",
+             }):
+            model, kwargs = runner._resolve_session_agent_runtime(
+                user_config=user_config,
+                guest_mode_invocation=True,
+            )
+
+        assert model == "deepseek-v4-pro"
+        assert kwargs["provider"] == "custom"
+        assert kwargs["base_url"] == "http://127.0.0.1:8099/v1"
+        assert kwargs["api_mode"] == "chat_completions"
+
+    def test_telegram_guest_mode_model_does_not_override_normal_calls(self):
+        """The dedicated guest model must not affect regular Telegram sessions."""
+        from gateway.run import GatewayRunner
+
+        runner = object.__new__(GatewayRunner)
+        runner._session_model_overrides = {}
+        user_config = {
+            "telegram": {
+                "guest_mode_model": {
+                    "provider": "custom:CommandCode",
+                    "model": "deepseek-v4-pro",
+                },
+            },
+        }
+
+        with patch("gateway.run._resolve_gateway_model", return_value="gpt-5.5"), \
+             patch("gateway.run._resolve_runtime_agent_kwargs", return_value={
+                 "provider": "openai-codex",
+                 "api_key": "codex-key",
+                 "base_url": "https://chatgpt.com/backend-api/codex",
+                 "api_mode": "codex_responses",
+             }):
+            model, kwargs = runner._resolve_session_agent_runtime(
+                user_config=user_config,
+                guest_mode_invocation=False,
+            )
+
+        assert model == "gpt-5.5"
+        assert kwargs["provider"] == "openai-codex"
+        assert kwargs["api_mode"] == "codex_responses"
+
 
 class TestResolveGatewayModel:
     """Test _resolve_gateway_model reads model from config correctly."""

@@ -3664,113 +3664,96 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_id=session_entry.session_id,
         )
 
-    def _sync_telegram_topic_binding(
+    def _parse_telegram_guest_mode_model_config(
         self,
-        source: SessionSource,
-        session_entry,
-        *,
-        reason: str,
-    ) -> None:
-        """Update the topic binding to point at ``session_entry.session_id``.
+        user_config: Optional[dict],
+    ) -> Optional[dict]:
+        """Return normalized telegram.guest_mode_model config, if present."""
+        telegram_cfg = (user_config or {}).get("telegram") or {}
+        if not isinstance(telegram_cfg, dict):
+            return None
+        raw = telegram_cfg.get("guest_mode_model") or telegram_cfg.get("guest_model")
+        if raw in (None, "", {}):
+            return None
 
-        Telegram topic lanes persist a (chat_id, thread_id) -> session_id row
-        so reopening a topic in a fresh process resumes the right Hermes
-        session. When compression rotates ``session_entry.session_id`` mid-turn,
-        the binding goes stale and the next inbound message in that topic
-        reloads the oversized parent transcript instead of the compressed
-        child, retriggering preflight compression — sometimes in a loop
-        (#20470, #29712, #33414).
-        """
-        if not self._is_telegram_topic_lane(source):
-            return
-        try:
-            self._record_telegram_topic_binding(source, session_entry)
-        except Exception:
-            logger.debug(
-                "telegram topic binding refresh failed (%s)", reason, exc_info=True,
-            )
-
-    def _recover_telegram_topic_thread_id(
-        self,
-        source: SessionSource,
-    ) -> Optional[str]:
-        """Pin DM-topic routing to the user's last-active topic.
-
-        Telegram can omit ``message_thread_id`` or surface General (``1``)
-        for some topic-mode DM replies. In those lobby-shaped cases, keep the
-        conversation attached to the user's most-recent bound topic.
-
-        Do not rewrite a non-lobby, previously-unbound thread id: a newly
-        created Telegram DM topic is also "unknown" until the first inbound
-        message is recorded, and rewriting it would send that brand-new topic's
-        answer into an older lane. Returns None to leave the source alone.
-        """
-        if (
-            source.platform != Platform.TELEGRAM
-            or source.chat_type != "dm"
-            or not source.chat_id
-            or not source.user_id
-            or not self._telegram_topic_mode_enabled(source)
-        ):
-            return None
-        inbound = str(source.thread_id or "")
-        is_lobby = not inbound or inbound in self._TELEGRAM_GENERAL_TOPIC_IDS
-        if not is_lobby:
-            # A non-lobby, unknown thread_id is most likely the first message in
-            # a brand-new Telegram DM topic. Preserve it so it can be recorded
-            # as a new independent lane below instead of hijacking the latest
-            # existing topic binding.
-            return None
-        session_db = getattr(self, "_session_db", None)
-        if session_db is None:
-            return None
-        # Runs off-loop (always via asyncio.to_thread); use the sync handle.
-        session_db = getattr(session_db, "_db", session_db)
-        try:
-            bindings = session_db.list_telegram_topic_bindings_for_chat(
-                chat_id=str(source.chat_id),
-            )
-        except Exception:
-            logger.debug("topic-recover: read failed", exc_info=True)
-            return None
-        if not bindings:
-            return None
-        user_id = str(source.user_id)
-        for b in bindings:  # newest-first
-            if str(b.get("user_id") or "") == user_id:
-                recovered = str(b.get("thread_id") or "")
-                if recovered and recovered != inbound:
-                    return recovered
+        if isinstance(raw, dict):
+            provider = str(raw.get("provider") or raw.get("provider_slug") or "").strip()
+            model = str(raw.get("model") or raw.get("default") or raw.get("name") or "").strip()
+            base_url = str(raw.get("base_url") or raw.get("api") or raw.get("url") or "").strip()
+            api_key = str(raw.get("api_key") or "").strip()
+            api_mode = str(raw.get("api_mode") or raw.get("transport") or "").strip()
+            if not (provider or model or base_url):
                 return None
+            return {
+                "provider": provider,
+                "model": model,
+                "base_url": base_url,
+                "api_key": api_key,
+                "api_mode": api_mode,
+            }
+
+        if isinstance(raw, str):
+            value = raw.strip()
+            if not value:
+                return None
+            provider = ""
+            model = value
+            # Compact form for named custom providers:
+            #   custom:CommandCode/deepseek-v4-pro
+            if value.lower().startswith("custom:") and "/" in value:
+                provider, model = value.rsplit("/", 1)
+            return {
+                "provider": provider.strip(),
+                "model": model.strip(),
+                "base_url": "",
+                "api_key": "",
+                "api_mode": "",
+            }
+
         return None
 
-    def _normalize_source_for_session_key(
+    def _apply_telegram_guest_mode_model_override(
         self,
-        source: SessionSource,
-    ) -> SessionSource:
-        """Apply Telegram DM topic recovery to a source for session-key purposes.
+        *,
+        user_config: Optional[dict],
+        model: str,
+        runtime_kwargs: dict,
+    ) -> tuple[str, dict]:
+        """Apply telegram.guest_mode_model to guest-mode Telegram invocations."""
+        guest_cfg = self._parse_telegram_guest_mode_model_config(user_config)
+        if not guest_cfg:
+            return model, runtime_kwargs
 
-        ``_handle_message_with_agent`` rewrites ``source.thread_id`` via
-        ``_recover_telegram_topic_thread_id`` *before* deriving the session
-        key for a normal message turn (a lobby/stripped reply gets pinned to
-        the user's last-active topic).  Session-scoped command handlers like
-        ``/model`` and ``/reasoning`` derive their override key from the raw
-        inbound ``event.source``, which skips that recovery — so the override
-        is stored under a different key than the next message turn reads,
-        and the override is silently dropped on Telegram forum topics and
-        after compression session splits (#30479).
-
-        Returns a recovery-normalized copy when a rewrite applies, otherwise
-        the original source unchanged.  Always derive the override storage key
-        from the result so storage and read use an identical key.
-        """
+        guest_model = guest_cfg.get("model") or model
+        guest_provider = guest_cfg.get("provider") or runtime_kwargs.get("provider") or ""
         try:
-            recovered = self._recover_telegram_topic_thread_id(source)
-        except Exception:
-            return source
-        if recovered is None:
-            return source
-        return dataclasses.replace(source, thread_id=recovered)
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+            runtime = resolve_runtime_provider(
+                requested=guest_provider or None,
+                explicit_base_url=guest_cfg.get("base_url") or None,
+                explicit_api_key=guest_cfg.get("api_key") or None,
+                target_model=guest_model,
+            )
+            resolved_runtime = {
+                "api_key": runtime.get("api_key"),
+                "base_url": runtime.get("base_url"),
+                "provider": runtime.get("provider"),
+                "api_mode": guest_cfg.get("api_mode") or runtime.get("api_mode"),
+                "command": runtime.get("command"),
+                "args": list(runtime.get("args") or []),
+                "credential_pool": runtime.get("credential_pool"),
+            }
+            resolved_model = guest_model or runtime.get("model") or model
+            logger.info(
+                "Telegram guest-mode model override: %s/%s -> %s/%s",
+                runtime_kwargs.get("provider"), model,
+                resolved_runtime.get("provider"), resolved_model,
+            )
+            return resolved_model, resolved_runtime
+        except Exception as exc:
+            logger.warning("Failed to apply telegram.guest_mode_model override: %s", exc)
+            return model, runtime_kwargs
 
     def _resolve_session_agent_runtime(
         self,
@@ -3778,6 +3761,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
         user_config: Optional[dict] = None,
+        guest_mode_invocation: bool = False,
     ) -> tuple[str, dict]:
         """Resolve model/runtime for a session.
 
@@ -3838,38 +3822,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 runtime_model,
             )
             model = runtime_model
-
-        cfg = getattr(self, "config", None)
-        if cfg and source is not None:
-            chat_id = str(source.chat_id) if source.chat_id else ""
-            thread_id = (
-                str(source.thread_id) if getattr(source, "thread_id", None) else None
+        if guest_mode_invocation and not override:
+            model, runtime_kwargs = self._apply_telegram_guest_mode_model_override(
+                user_config=user_config,
+                model=model,
+                runtime_kwargs=runtime_kwargs,
             )
-            parent_id = (
-                str(source.parent_chat_id)
-                if getattr(source, "parent_chat_id", None)
-                else None
-            )
-            ch = _get_channel_override(
-                cfg,
-                source.platform,
-                chat_id,
-                thread_id=thread_id,
-                parent_id=parent_id,
-            )
-            if ch:
-                if ch.model:
-                    model = ch.model
-                if ch.provider:
-                    runtime_kwargs = _resolve_runtime_agent_kwargs_for_provider(
-                        ch.provider
-                    )
-                    ch_runtime_model = runtime_kwargs.pop("model", None)
-                    # Only adopt the provider's bundled model when the override
-                    # did not specify an explicit model.
-                    if ch_runtime_model and not ch.model:
-                        model = ch_runtime_model
-
         if override and resolved_session_key:
             model, runtime_kwargs = self._apply_session_model_override(
                 resolved_session_key, model, runtime_kwargs
@@ -11579,9 +11537,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
-                moa_config=getattr(event, "_moa_config", None),
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
+                guest_mode_invocation=bool(getattr(event, "guest_mode_invocation", False)),
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -17303,70 +17259,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
-        moa_config: Optional[dict] = None,
-        persist_user_message: Optional[str] = None,
-        persist_user_timestamp: Optional[float] = None,
-    ) -> Dict[str, Any]:
-        """Profile-scoping wrapper around the agent run.
-
-        When multiplexing is active, resolve the inbound source's profile and
-        run the whole turn inside ``_profile_runtime_scope`` so config/skills/
-        memory resolve to that profile's home AND credentials resolve from that
-        profile's secret scope (never the process-global ``os.environ``). When
-        multiplexing is off this is a transparent pass-through — zero behavior
-        change for single-profile gateways.
-        """
-        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
-            return await self._run_agent_inner(
-                message, context_prompt, history, source, session_id,
-                session_key=session_key, run_generation=run_generation,
-                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
-                channel_prompt=channel_prompt, moa_config=moa_config,
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
-            )
-
-        profile_home = self._resolve_profile_home_for_source(source)
-        with _profile_runtime_scope(profile_home):
-            return await self._run_agent_inner(
-                message, context_prompt, history, source, session_id,
-                session_key=session_key, run_generation=run_generation,
-                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
-                channel_prompt=channel_prompt, moa_config=moa_config,
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
-            )
-
-    def _resolve_profile_home_for_source(self, source: SessionSource) -> "Path":
-        """Resolve which profile's HERMES_HOME should serve this inbound source.
-
-        Prefers the profile the source was routed to (``source.profile`` — set
-        by the /p/<profile>/ URL prefix or a per-credential adapter), falling
-        back to the active profile (the multiplexer's own home).
-        """
-        from hermes_cli.profiles import get_active_profile_name, get_profile_dir
-        try:
-            name = (source.profile or "").strip() or get_active_profile_name() or "default"
-            return get_profile_dir(name)
-        except Exception:
-            from hermes_constants import get_hermes_home
-            return get_hermes_home()
-
-    async def _run_agent_inner(
-        self,
-        message: str,
-        context_prompt: str,
-        history: List[Dict[str, Any]],
-        source: SessionSource,
-        session_id: str,
-        session_key: str = None,
-        run_generation: Optional[int] = None,
-        _interrupt_depth: int = 0,
-        event_message_id: Optional[str] = None,
-        channel_prompt: Optional[str] = None,
-        moa_config: Optional[dict] = None,
-        persist_user_message: Optional[str] = None,
-        persist_user_timestamp: Optional[float] = None,
+        guest_mode_invocation: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -18301,6 +18194,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     source=source,
                     session_key=session_key,
                     user_config=user_config,
+                    guest_mode_invocation=guest_mode_invocation,
                 )
                 logger.debug(
                     "run_agent resolved: model=%s provider=%s session=%s",
@@ -20238,6 +20132,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    guest_mode_invocation=guest_mode_invocation,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

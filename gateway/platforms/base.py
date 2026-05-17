@@ -1759,6 +1759,10 @@ class MessageEvent:
     # Applied at API call time and never persisted to transcript history.
     channel_prompt: Optional[str] = None
 
+    # True when the platform adapter accepted the message through its
+    # guest-mode path (e.g. Telegram group @mention while guest_mode is on).
+    guest_mode_invocation: bool = False
+
     # Channel context recovered by history backfill (e.g. messages between
     # bot turns that were missed due to require_mention).  Kept separate
     # from ``text`` so the sender-prefix logic in run.py can operate on the
