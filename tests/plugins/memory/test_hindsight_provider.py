@@ -1036,6 +1036,40 @@ class TestSyncTurn:
         p._retain_queue.join()
         assert p._client.aretain_batch.call_count == 1
 
+    def test_sync_turn_skips_model_switch_noise(self, provider_with_config):
+        p = provider_with_config(auto_retain_filter_enabled=True)
+        p.sync_turn(
+            "[Note: model was just switched from gpt-5.4 to gpt-5.5 via OpenAI Codex.]",
+            "",
+        )
+        p._retain_queue.join()
+        assert p._client.aretain_batch.call_count == 0
+        assert p._session_turns == []
+        assert p._turn_counter == 0
+
+    def test_sync_turn_strips_noise_from_mixed_turn_before_retaining(self, provider_with_config):
+        p = provider_with_config(auto_retain_filter_enabled=True)
+        p.sync_turn(
+            "[Note: model was just switched from gpt-5.4 to gpt-5.5 via OpenAI Codex.]\nRemember: user prefers concise answers.",
+            "done",
+        )
+        p._retain_queue.join()
+
+        item = p._client.aretain_batch.call_args.kwargs["items"][0]
+        content = item["content"]
+        assert "model was just switched" not in content
+        assert "Remember: user prefers concise answers." in content
+
+    def test_sync_turn_preserve_pattern_overrides_skip_pattern(self, provider_with_config):
+        p = provider_with_config(
+            auto_retain_filter_enabled=True,
+            auto_retain_skip_patterns=[r"(?is).*temporary debug note.*"],
+            auto_retain_preserve_patterns=[r"(?i)remember"],
+        )
+        p.sync_turn("Remember this temporary debug note as durable context", "ok")
+        p._retain_queue.join()
+        assert p._client.aretain_batch.call_count == 1
+
     def test_sync_turn_appends_only_delta_when_append_supported(self, provider_with_config, monkeypatch):
         """On append-capable APIs each retain ships only the new turns, not the whole session."""
         monkeypatch.setattr(
