@@ -5676,6 +5676,63 @@ class TestCredentialPoolRecovery:
         agent._swap_credential.assert_called_once_with(next_entry)
 
 
+    def test_recover_with_pool_rotates_usage_limit_429_immediately(self, agent):
+        next_entry = SimpleNamespace(label="secondary")
+        captured = {}
+
+        class _Pool:
+            def current(self):
+                return SimpleNamespace(label="primary")
+
+            def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
+                captured["status_code"] = status_code
+                captured["error_context"] = error_context
+                return next_entry
+
+        agent._credential_pool = _Pool()
+        agent._swap_credential = MagicMock()
+
+        recovered, retry_same = agent._recover_with_credential_pool(
+            status_code=429,
+            has_retried_429=False,
+            error_context={
+                "reason": "usage_limit_reached",
+                "message": "The usage limit has been reached",
+            },
+        )
+
+        assert recovered is True
+        assert retry_same is False
+        assert captured["status_code"] == 429
+        assert captured["error_context"]["reason"] == "usage_limit_reached"
+        agent._swap_credential.assert_called_once_with(next_entry)
+
+    def test_recover_with_pool_marks_active_entry_id(self, agent):
+        next_entry = SimpleNamespace(label="secondary", id="cred-2")
+        captured = {}
+
+        class _Pool:
+            def mark_exhausted_and_rotate(self, **kwargs):
+                captured.update(kwargs)
+                return next_entry
+
+        agent._credential_pool = _Pool()
+        agent._credential_pool_entry_id = "cred-1"
+        agent._swap_credential = MagicMock()
+
+        recovered, retry_same = agent._recover_with_credential_pool(
+            status_code=429,
+            has_retried_429=False,
+            error_context={"reason": "usage_limit_reached"},
+        )
+
+        assert recovered is True
+        assert retry_same is False
+        assert captured["credential_id"] == "cred-1"
+        agent._swap_credential.assert_called_once_with(next_entry)
+
+
+
     def test_recover_with_pool_refreshes_on_401(self, agent):
         """401 with successful refresh should swap to refreshed credential."""
         refreshed_entry = SimpleNamespace(label="refreshed-primary", id="abc")

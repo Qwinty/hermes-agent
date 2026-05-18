@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 import random
 import threading
 import time
 import uuid
 import re
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,7 +19,6 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from hermes_constants import OPENROUTER_BASE_URL
 from hermes_cli.config import load_env
-from agent.secret_scope import get_secret as _get_secret
 from agent.credential_persistence import (
     is_borrowed_credential_source,
     sanitize_borrowed_credential_payload,
@@ -297,16 +299,6 @@ def _extract_retry_delay_seconds(message: str) -> Optional[float]:
     sec_match = re.search(r"retry\s+(?:after\s+)?(\d+(?:\.\d+)?)\s*(?:sec|secs|seconds|s\b)", message, re.IGNORECASE)
     if sec_match:
         return float(sec_match.group(1))
-    # "Resets in 4hr 5min" format used by OpenCode Go weekly usage limits
-    hr_min_match = re.search(r"resets?\s+in\s+(\d+)\s*hr\s+(\d+)\s*min", message, re.IGNORECASE)
-    if hr_min_match:
-        return int(hr_min_match.group(1)) * 3600 + int(hr_min_match.group(2)) * 60
-    hr_only_match = re.search(r"resets?\s+in\s+(\d+)\s*hr\b", message, re.IGNORECASE)
-    if hr_only_match:
-        return int(hr_only_match.group(1)) * 3600
-    min_only_match = re.search(r"resets?\s+in\s+(\d+)\s*min\b", message, re.IGNORECASE)
-    if min_only_match:
-        return int(min_only_match.group(1)) * 60
     return None
 
 
@@ -333,6 +325,99 @@ def _normalize_error_context(error_context: Optional[Dict[str, Any]]) -> Dict[st
     if parsed_reset_at is not None:
         normalized["reset_at"] = parsed_reset_at
     return normalized
+
+
+@dataclass(frozen=True)
+class _CodexUsageStatus:
+    available: bool
+    reset_at: Optional[float] = None
+    reason: Optional[str] = None
+    message: Optional[str] = None
+
+
+def _codex_usage_url_for_entry(entry: PooledCredential) -> str:
+    base_url = (entry.runtime_base_url or entry.base_url or "https://chatgpt.com/backend-api/codex").rstrip("/")
+    if base_url.endswith("/codex"):
+        base_url = base_url[: -len("/codex")]
+    if "/backend-api" in base_url:
+        return base_url + "/wham/usage"
+    return base_url + "/api/codex/usage"
+
+
+def _codex_account_id_from_token(access_token: str) -> Optional[str]:
+    claims = _decode_jwt_claims(access_token)
+    auth_claims = claims.get("https://api.openai.com/auth")
+    if isinstance(auth_claims, dict):
+        account_id = auth_claims.get("chatgpt_account_id")
+        if isinstance(account_id, str) and account_id.strip():
+            return account_id.strip()
+    return None
+
+
+def _fetch_codex_entry_usage_status(entry: PooledCredential) -> Optional[_CodexUsageStatus]:
+    access_token = str(entry.access_token or "").strip()
+    if not access_token:
+        return None
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Accept": "application/json",
+        "User-Agent": "codex_cli_rs/0.0.0 (Hermes Agent)",
+        "originator": "codex_cli_rs",
+    }
+    account_id = _codex_account_id_from_token(access_token)
+    if account_id:
+        headers["ChatGPT-Account-ID"] = account_id
+
+    timeout = float(os.getenv("HERMES_CODEX_USAGE_TIMEOUT_SECONDS", "8") or "8")
+    request = urllib.request.Request(_codex_usage_url_for_entry(entry), headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8") or "{}")
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
+        logger.debug("Codex usage probe failed for pool entry %s: %s", entry.label or entry.id, exc)
+        return None
+
+    rate_limit = payload.get("rate_limit") if isinstance(payload, dict) else None
+    if not isinstance(rate_limit, dict):
+        return None
+
+    primary_window = rate_limit.get("primary_window")
+    secondary_window = rate_limit.get("secondary_window")
+    reset_at = None
+    if isinstance(primary_window, dict):
+        reset_at = _parse_absolute_timestamp(primary_window.get("reset_at"))
+    if reset_at is None and isinstance(secondary_window, dict):
+        reset_at = _parse_absolute_timestamp(secondary_window.get("reset_at"))
+
+    allowed = rate_limit.get("allowed")
+    limit_reached = rate_limit.get("limit_reached")
+    if allowed is True:
+        return _CodexUsageStatus(available=True, reset_at=reset_at)
+    if limit_reached is True or allowed is False:
+        return _CodexUsageStatus(
+            available=False,
+            reset_at=reset_at,
+            reason="usage_limit_reached",
+            message="The usage limit has been reached",
+        )
+
+    used_values: list[float] = []
+    for window in (primary_window, secondary_window):
+        if isinstance(window, dict):
+            used = window.get("used_percent")
+            if isinstance(used, (int, float)):
+                used_values.append(float(used))
+    if used_values and max(used_values) < 100:
+        return _CodexUsageStatus(available=True, reset_at=reset_at)
+    if used_values and max(used_values) >= 100:
+        return _CodexUsageStatus(
+            available=False,
+            reset_at=reset_at,
+            reason="usage_limit_reached",
+            message="The usage limit has been reached",
+        )
+    return None
 
 
 def _exhausted_until(entry: PooledCredential) -> Optional[float]:
@@ -529,6 +614,11 @@ class CredentialPool:
         if not self._current_id:
             return None
         return next((entry for entry in self._entries if entry.id == self._current_id), None)
+
+    def _entry_by_id(self, credential_id: Optional[str]) -> Optional[PooledCredential]:
+        if not credential_id:
+            return None
+        return next((entry for entry in self._entries if entry.id == credential_id), None)
 
     def _replace_entry(self, old: PooledCredential, new: PooledCredential) -> None:
         """Swap an entry in-place by id, preserving sort order."""
@@ -1482,6 +1572,9 @@ class CredentialPool:
 
     def _select_unlocked(self) -> Optional[PooledCredential]:
         available = self._available_entries(clear_expired=True, refresh=True)
+        if not available and self.provider == "openai-codex":
+            if self._reconcile_codex_usage_unlocked():
+                available = self._available_entries(clear_expired=True, refresh=True)
         if not available:
             self._current_id = None
             logger.info("credential pool: no available entries (all exhausted or empty)")
@@ -1525,21 +1618,26 @@ class CredentialPool:
         *,
         status_code: Optional[int],
         error_context: Optional[Dict[str, Any]] = None,
+        credential_id: Optional[str] = None,
         api_key_hint: Optional[str] = None,
     ) -> Optional[PooledCredential]:
         with self._lock:
-            entry = None
-            if api_key_hint:
-                # Prefer the specific entry whose API key matches the one that
-                # actually failed.  When this pool was freshly loaded from disk
-                # (another process already rotated), current() is None and
-                # _select_unlocked() would return the NEXT key — the wrong one.
+            entry = self._entry_by_id(credential_id) if credential_id else None
+            if credential_id and entry is None:
+                logger.debug(
+                    "credential pool: requested exhausted mark for missing entry %s; falling back to current",
+                    credential_id,
+                )
+            if entry is None and api_key_hint:
+                # When another process already rotated the pool and this instance
+                # reloads from disk, current() can be None and _select_unlocked()
+                # would otherwise pick the NEXT key. Prefer the specific entry
+                # that actually failed when we still know its runtime API key.
                 entry = next(
                     (e for e in self._entries if e.runtime_api_key == api_key_hint),
                     None,
                 )
-            if entry is None:
-                entry = self.current() or self._select_unlocked()
+            entry = entry or self.current() or self._select_unlocked()
             if entry is None:
                 return None
             _label = entry.label or entry.id[:8]
@@ -1565,6 +1663,60 @@ class CredentialPool:
                 _next_label = next_entry.label or next_entry.id[:8]
                 logger.info("credential pool: rotated to %s", _next_label)
             return next_entry
+
+    def reconcile_live_usage(self) -> int:
+        """Refresh live provider usage state for pool entries that support it."""
+        if self.provider != "openai-codex":
+            return 0
+        with self._lock:
+            return self._reconcile_codex_usage_unlocked()
+
+    def _reconcile_codex_usage_unlocked(self) -> int:
+        changed = 0
+        for entry in list(self._entries):
+            if entry.last_status != STATUS_EXHAUSTED:
+                continue
+            if self._entry_needs_refresh(entry):
+                refreshed = self._refresh_entry(entry, force=False)
+                if refreshed is None:
+                    continue
+                entry = refreshed
+            status = _fetch_codex_entry_usage_status(entry)
+            if status is None:
+                continue
+            if status.available:
+                updated = replace(
+                    entry,
+                    last_status=STATUS_OK,
+                    last_status_at=None,
+                    last_error_code=None,
+                    last_error_reason=None,
+                    last_error_message=None,
+                    last_error_reset_at=None,
+                )
+                self._replace_entry(entry, updated)
+                changed += 1
+                logger.info(
+                    "credential pool: cleared stale Codex exhaustion for %s from live usage",
+                    entry.label or entry.id[:8],
+                )
+                continue
+
+            updated = replace(
+                entry,
+                last_status=STATUS_EXHAUSTED,
+                last_status_at=entry.last_status_at or time.time(),
+                last_error_code=429,
+                last_error_reason=status.reason or entry.last_error_reason,
+                last_error_message=status.message or entry.last_error_message,
+                last_error_reset_at=status.reset_at or entry.last_error_reset_at,
+            )
+            if updated != entry:
+                self._replace_entry(entry, updated)
+                changed += 1
+        if changed:
+            self._persist()
+        return changed
 
     def acquire_lease(self, credential_id: Optional[str] = None) -> Optional[str]:
         """Acquire a soft lease on a credential.
@@ -1606,12 +1758,13 @@ class CredentialPool:
             else:
                 self._active_leases[credential_id] = count - 1
 
-    def try_refresh_current(self) -> Optional[PooledCredential]:
+    def try_refresh_current(self, credential_id: Optional[str] = None) -> Optional[PooledCredential]:
         with self._lock:
-            return self._try_refresh_current_unlocked()
+            return self._try_refresh_current_unlocked(credential_id=credential_id)
 
-    def _try_refresh_current_unlocked(self) -> Optional[PooledCredential]:
-        entry = self.current()
+    def _try_refresh_current_unlocked(self, credential_id: Optional[str] = None) -> Optional[PooledCredential]:
+        entry = self._entry_by_id(credential_id) if credential_id else None
+        entry = entry or self.current()
         if entry is None:
             return None
         refreshed = self._refresh_entry(entry, force=True)
@@ -1791,48 +1944,6 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                 return changed, active_sources
         except ImportError:
             pass
-
-        # API-key vs OAuth is a user-visible choice at `hermes setup` ("Claude
-        # Pro/Max subscription" vs "Anthropic API key").  The signal that the
-        # user picked the API-key path is: ANTHROPIC_API_KEY set in the env,
-        # AND no OAuth env vars set — `save_anthropic_api_key()` writes the
-        # API key and zeros ANTHROPIC_TOKEN; `save_anthropic_oauth_token()`
-        # does the inverse.  When that signal is present we MUST NOT seed
-        # autodiscovered OAuth tokens (~/.claude/.credentials.json from the
-        # Claude Code CLI, hermes_pkce creds from a previous OAuth login)
-        # into the anthropic pool — otherwise rotation on a 401/429 silently
-        # flips the session onto an OAuth credential, which forces the Claude
-        # Code identity injection, `mcp_` tool-name rewrite, and claude-cli
-        # User-Agent header (`agent/anthropic_adapter.py:2128`).  Users who
-        # explicitly opted into the API-key path are explicitly opting OUT of
-        # that masquerade.  Prefer ~/.hermes/.env over os.environ for the
-        # same reason `_seed_from_env` does — that's the authoritative file
-        # that `hermes setup` writes.
-        _env_file = load_env()
-
-        def _env_val(key: str) -> str:
-            return (_env_file.get(key) or _get_secret(key, "") or "").strip()
-
-        anthropic_api_key = _env_val("ANTHROPIC_API_KEY")
-        anthropic_oauth_env = (
-            _env_val("ANTHROPIC_TOKEN") or _env_val("CLAUDE_CODE_OAUTH_TOKEN")
-        )
-        api_key_path_explicit = bool(anthropic_api_key and not anthropic_oauth_env)
-
-        if api_key_path_explicit:
-            # Prune any stale autodiscovered OAuth entries that may have been
-            # seeded into the on-disk pool during a previous OAuth session.
-            # Without this, switching OAuth -> API key at setup leaves the
-            # OAuth entries dormant in auth.json forever and rotation on a
-            # transient 401 could revive them.
-            retained = [
-                entry for entry in entries
-                if entry.source not in {"hermes_pkce", "claude_code"}
-            ]
-            if len(retained) != len(entries):
-                entries[:] = retained
-                changed = True
-            return changed, active_sources
 
         from agent.anthropic_adapter import read_claude_code_credentials, read_hermes_oauth_credentials
 
@@ -2102,7 +2213,7 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
     # changes to the .env file.
     def _get_env_prefer_dotenv(key: str) -> str:
         env_file = load_env()
-        val = env_file.get(key) or _get_secret(key, "") or ""
+        val = env_file.get(key) or os.environ.get(key) or ""
         return val.strip()
 
     # Honour user suppression — `hermes auth remove <provider> <N>` for an
