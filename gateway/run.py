@@ -1113,6 +1113,7 @@ def _resolve_runtime_agent_kwargs() -> dict:
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool"),
+        "credential_pool_entry_id": runtime.get("credential_pool_entry_id"),
     }
 
 
@@ -1160,6 +1161,7 @@ def _try_resolve_fallback_provider() -> dict | None:
                     "command": runtime.get("command"),
                     "args": list(runtime.get("args") or []),
                     "credential_pool": runtime.get("credential_pool"),
+                    "credential_pool_entry_id": runtime.get("credential_pool_entry_id"),
                     "model": entry.get("model"),
                 }
             except Exception as fb_exc:
@@ -2410,6 +2412,8 @@ class GatewayRunner:
                 "api_key": override.get("api_key"),
                 "base_url": override.get("base_url"),
                 "api_mode": override.get("api_mode"),
+                "credential_pool": _load_credential_pool_for_provider(override.get("provider")),
+                "credential_pool_entry_id": override.get("credential_pool_entry_id"),
             }
             if override_runtime.get("api_key"):
                 logger.debug(
@@ -2481,6 +2485,7 @@ class GatewayRunner:
             "command": runtime_kwargs.get("command"),
             "args": list(runtime_kwargs.get("args") or []),
             "credential_pool": runtime_kwargs.get("credential_pool"),
+            "credential_pool_entry_id": runtime_kwargs.get("credential_pool_entry_id"),
         }
         route = {
             "model": model,
