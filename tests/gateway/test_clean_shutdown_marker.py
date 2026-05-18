@@ -226,3 +226,77 @@ class TestCleanShutdownMarker:
             asyncio.get_event_loop().run_until_complete(runner.stop(restart=True))
 
         assert marker.exists(), ".clean_shutdown marker should exist after restart-stop too"
+
+    def test_active_sessions_are_resume_marked_before_drain(self, tmp_path, monkeypatch):
+        """Active sessions must be durable before the drain window starts.
+
+        systemd can kill the gateway while stop() is still waiting for the
+        drain timeout.  If resume_pending is only written after the timeout,
+        long-running sessions whose updated_at is older than the startup
+        fallback window are lost/stopped after restart.
+        """
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+        marker = tmp_path / ".clean_shutdown"
+
+        from gateway.run import GatewayRunner
+        runner = object.__new__(GatewayRunner)
+        runner._restart_requested = False
+        runner._restart_detached = False
+        runner._restart_via_service = False
+        runner._restart_task_started = False
+        runner._running = True
+        runner._draining = False
+        runner._stop_task = None
+        runner._pending_messages = {}
+        runner._pending_approvals = {}
+        runner._background_tasks = set()
+        runner._shutdown_event = MagicMock()
+        runner._restart_drain_timeout = 5
+        runner._exit_code = None
+        runner._exit_reason = None
+        runner.adapters = {}
+        runner.config = GatewayConfig()
+        runner._running_agents_ts = {}
+
+        store = _make_store(tmp_path)
+        source = _make_source(chat_id="273403055", user_id="273403055")
+        entry = store.get_or_create_session(source)
+        # Make the startup suspend_recently_active(updated_at cutoff) fallback
+        # intentionally unable to catch this session; only early durable marking
+        # can preserve it if the process dies during drain.
+        with store._lock:
+            entry.updated_at = datetime.now() - timedelta(minutes=10)
+            store._save()
+        runner.session_store = store
+        running_agent = object()
+        runner._running_agents = {entry.session_key: running_agent}
+
+        async def assert_marked_before_drain(_runner, timeout):
+            with store._lock:
+                store._ensure_loaded_locked()
+                refreshed = store._entries[entry.session_key]
+                assert refreshed.resume_pending is True
+                assert refreshed.resume_reason == "restart_timeout"
+            return ({entry.session_key: running_agent}, False)
+
+        with patch("gateway.run.GatewayRunner._drain_active_agents", new=assert_marked_before_drain), \
+             patch("gateway.run.GatewayRunner._finalize_shutdown_agents"), \
+             patch("gateway.run.GatewayRunner._update_runtime_status"), \
+             patch("gateway.status.remove_pid_file"), \
+             patch("gateway.status.release_gateway_runtime_lock"), \
+             patch("tools.process_registry.process_registry") as mock_proc_reg, \
+             patch("tools.terminal_tool.cleanup_all_environments"), \
+             patch("tools.browser_tool.cleanup_all_browsers"):
+            mock_proc_reg.kill_all = MagicMock()
+
+            import asyncio
+            asyncio.get_event_loop().run_until_complete(runner.stop(restart=True))
+
+        # Because the mocked drain completed gracefully, stop() should clean up
+        # the early marker and still write the clean-shutdown marker.
+        with store._lock:
+            store._ensure_loaded_locked()
+            refreshed = store._entries[entry.session_key]
+            assert refreshed.resume_pending is False
+            assert refreshed.resume_reason is None
+        assert marker.exists(), ".clean_shutdown marker should exist after graceful restart-stop"
