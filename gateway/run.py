@@ -3095,9 +3095,14 @@ class GatewayRunner:
                     )
                     continue
 
-                # Include thread_id if present so the message lands in the
-                # correct forum topic / thread.
-                metadata = {"thread_id": thread_id} if thread_id else None
+                # Include platform-aware thread metadata so Telegram DM topic
+                # lanes keep both their topic id and reply anchor instead of
+                # falling back to the parent DM during restart/shutdown notices.
+                metadata = (
+                    self._thread_metadata_for_source(source)
+                    if source is not None
+                    else ({"thread_id": thread_id} if thread_id else None)
+                )
 
                 result = await adapter.send(chat_id, msg, metadata=metadata)
                 if result is not None and getattr(result, "success", True) is False:
@@ -9264,9 +9269,12 @@ class GatewayRunner:
             notify_data = {
                 "platform": event.source.platform.value if event.source.platform else None,
                 "chat_id": event.source.chat_id,
+                "chat_type": event.source.chat_type,
             }
             if event.source.thread_id:
                 notify_data["thread_id"] = event.source.thread_id
+            if event.message_id:
+                notify_data["message_id"] = str(event.message_id)
             atomic_json_write(
                 _hermes_home / ".restart_notify.json",
                 notify_data,
@@ -13522,6 +13530,8 @@ class GatewayRunner:
             platform_str = data.get("platform")
             chat_id = data.get("chat_id")
             thread_id = data.get("thread_id")
+            chat_type = data.get("chat_type") or ("group" if thread_id else "dm")
+            message_id = data.get("message_id")
 
             if not platform_str or not chat_id:
                 return None
@@ -13543,7 +13553,14 @@ class GatewayRunner:
                 )
                 return None
 
-            metadata = {"thread_id": thread_id} if thread_id else None
+            source = SessionSource(
+                platform=platform,
+                chat_id=str(chat_id),
+                chat_type=str(chat_type),
+                thread_id=str(thread_id) if thread_id else None,
+                message_id=str(message_id) if message_id is not None else None,
+            )
+            metadata = self._thread_metadata_for_source(source) if thread_id else None
             result = await adapter.send(
                 str(chat_id),
                 "♻ Gateway restarted successfully. Your session continues.",

@@ -130,6 +130,30 @@ async def test_restart_command_preserves_thread_id(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_restart_command_preserves_telegram_dm_topic_reply_anchor(tmp_path, monkeypatch):
+    """DM topic restarts need the triggering message id after process restart."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    runner, _adapter = make_restart_runner()
+    runner.request_restart = MagicMock(return_value=True)
+
+    source = make_restart_source(chat_id="99", chat_type="dm", thread_id="20197")
+    event = MessageEvent(
+        text="/restart",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="463",
+    )
+
+    await runner._handle_restart_command(event)
+
+    data = json.loads((tmp_path / ".restart_notify.json").read_text())
+    assert data["thread_id"] == "20197"
+    assert data["chat_type"] == "dm"
+    assert data["message_id"] == "463"
+
+
+@pytest.mark.asyncio
 async def test_restart_command_uses_atomic_json_writes_for_marker_files(tmp_path, monkeypatch):
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
@@ -389,6 +413,38 @@ async def test_send_restart_notification_with_thread(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_send_restart_notification_for_telegram_dm_topic_uses_reply_fallback_metadata(
+    tmp_path, monkeypatch
+):
+    """DM topic comeback pings must keep both topic id and reply anchor."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    notify_path = tmp_path / ".restart_notify.json"
+    notify_path.write_text(json.dumps({
+        "platform": "telegram",
+        "chat_id": "99",
+        "thread_id": "20197",
+        "chat_type": "dm",
+        "message_id": "463",
+    }))
+
+    runner, adapter = make_restart_runner()
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="restart"))
+
+    delivered_target = await runner._send_restart_notification()
+
+    assert delivered_target == ("telegram", "99", "20197")
+    call_args = adapter.send.call_args
+    assert call_args[1]["metadata"] == {
+        "thread_id": "20197",
+        "telegram_dm_topic_reply_fallback": True,
+        "direct_messages_topic_id": "20197",
+        "telegram_reply_to_message_id": "463",
+    }
+    assert not notify_path.exists()
+
+
+@pytest.mark.asyncio
 async def test_send_restart_notification_noop_when_no_file(tmp_path, monkeypatch):
     """Nothing happens if there's no pending restart notification."""
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
@@ -622,4 +678,29 @@ async def test_shutdown_notifications_use_cached_live_thread_source_when_origin_
         "parent-42",
         "⚠️ Gateway shutting down — Your current task will be interrupted.",
         metadata={"thread_id": "topic-7"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_shutdown_notification_for_telegram_dm_topic_uses_reply_fallback_metadata():
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="99", chat_type="dm", thread_id="20197")
+    source.message_id = "463"
+    session_key = build_session_key(source)
+
+    runner._running_agents[session_key] = object()
+    runner.session_store._entries[session_key] = MagicMock(origin=source)
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="shutdown"))
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    adapter.send.assert_awaited_once_with(
+        "99",
+        "⚠️ Gateway shutting down — Your current task will be interrupted.",
+        metadata={
+            "thread_id": "20197",
+            "telegram_dm_topic_reply_fallback": True,
+            "direct_messages_topic_id": "20197",
+            "telegram_reply_to_message_id": "463",
+        },
     )
