@@ -17,7 +17,7 @@ from types import SimpleNamespace
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.session import SessionSource
 
 
@@ -73,6 +73,27 @@ class PreInterruptAgent:
         self.tool_progress_callback("tool.started", "web_search", "first search", {})
         time.sleep(0.35)  # let the drain loop process
         return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class GuestInterruptedAgent:
+    """Returns an interrupted result while a guest follow-up is queued."""
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+        self._interrupt_requested = True
+
+    @property
+    def is_interrupted(self) -> bool:
+        return self._interrupt_requested
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        return {
+            "final_response": "first interrupted",
+            "messages": [],
+            "api_calls": 1,
+            "interrupted": True,
+        }
 
 
 class InterruptedAgent:
@@ -188,6 +209,68 @@ async def _run_once(monkeypatch, tmp_path, agent_cls, session_id):
         session_key="agent:main:telegram:group:-1001:17585",
     )
     return adapter, result
+
+
+@pytest.mark.asyncio
+async def test_guest_pending_followup_remains_for_adapter_delivery_source(monkeypatch, tmp_path):
+    """Guest follow-ups must drain through BasePlatformAdapter with their own guest query id.
+
+    GatewayRunner._run_agent normally consumes queued follow-ups in-band.  That
+    is correct for normal chats where source.chat_id is stable, but guest-mode
+    chat_id is a one-shot guest_query_id.  If the runner consumes the follow-up,
+    the outer adapter task will send the final answer to the previous query id.
+    """
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = GuestInterruptedAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = ProgressCaptureAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"api_key": "fake"},
+    )
+
+    session_key = "telegram:guest-session:-100123:query:guest-query-1:273403055"
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="guest:guest-query-1",
+        chat_type="dm",
+        user_id="273403055",
+    )
+    pending_source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="guest:guest-query-2",
+        chat_type="dm",
+        user_id="273403055",
+    )
+    pending_event = MessageEvent(
+        text="follow-up",
+        source=pending_source,
+        session_key_override=session_key,
+    )
+    adapter._pending_messages[session_key] = pending_event
+
+    result = await runner._run_agent(
+        message="first",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-guest",
+        session_key=session_key,
+    )
+
+    assert result["final_response"] == "first interrupted"
+    assert adapter._pending_messages[session_key] is pending_event
 
 
 @pytest.mark.asyncio
