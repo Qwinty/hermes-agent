@@ -1345,6 +1345,8 @@ SUPPORTED_DOCUMENT_TYPES = {
     ".cfg": "text/plain",
     ".zip": "application/zip",
     ".doc": "application/msword",
+    ".rar": "application/vnd.rar",
+    ".7z": "application/x-7z-compressed",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ".xls": "application/vnd.ms-excel",
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
