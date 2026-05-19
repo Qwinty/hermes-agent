@@ -3548,6 +3548,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             profile=_profile,
         )
 
+    def _session_key_for_event(self, event: MessageEvent) -> str:
+        """Resolve the session key for an inbound event, including explicit overrides."""
+        override = str(getattr(event, "session_key_override", "") or "").strip()
+        if override:
+            return override
+        return self._session_key_for_source(event.source)
+
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
         """Return whether Telegram DM topic mode is active for this chat."""
         if source.platform != Platform.TELEGRAM or source.chat_type != "dm":
@@ -9154,7 +9161,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # IMPORTANT: recognized slash commands must bypass this interception.
         # Otherwise control/session commands like /new or /help get silently
         # consumed as update answers instead of being dispatched normally.
-        _quick_key = self._session_key_for_source(source)
+        _quick_key = self._session_key_for_event(event)
         _update_prompts = getattr(self, "_update_prompt_pending", {})
         if _update_prompts.get(_quick_key):
             raw = (event.text or "").strip()
@@ -10444,7 +10451,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # on error. Let the user drive the next turn.
                 if _final_text.strip():
                     try:
-                        session_entry = self.session_store.get_or_create_session(source)
+                        session_entry = self.session_store.get_or_create_session(
+                            source,
+                            session_key_override=(
+                                str(getattr(event, "session_key_override", "") or "").strip() or None
+                            ),
+                        )
                     except Exception:
                         session_entry = None
                     if session_entry is not None:
@@ -10522,9 +10534,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _group_sessions_per_user = getattr(self.config, "group_sessions_per_user", True)
         _thread_sessions_per_user = getattr(self.config, "thread_sessions_per_user", False)
         # Prefer the already resolved session key from the caller so this write
-        # key matches the consume key at the run_conversation site. Fall back
-        # to deriving it here for tests and legacy standalone callers.
-        session_key = session_key or self._session_key_for_source(source)
+        # key matches the consume key at the run_conversation site. Fall back to
+        # the event-aware resolver so explicit session overrides (Telegram Guest
+        # Mode, tests, and future synthetic events) still share one key.
+        session_key = session_key or self._session_key_for_event(event)
         # Reset only this session's per-call buffer; other sessions may be
         # concurrently preparing multimodal turns on the same runner.
         self._consume_pending_native_image_paths(session_key)
@@ -10738,6 +10751,56 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"{message_text}"
                 )
 
+        if getattr(event, "reply_to_media_urls", None):
+            reply_image_paths: list[str] = []
+            reply_audio_paths: list[str] = []
+            reply_file_paths: list[str] = []
+            reply_media_urls = list(getattr(event, "reply_to_media_urls", None) or [])
+            reply_media_types = list(getattr(event, "reply_to_media_types", None) or [])
+            for i, path in enumerate(reply_media_urls):
+                mtype = reply_media_types[i] if i < len(reply_media_types) else ""
+                if mtype.startswith("image/"):
+                    reply_image_paths.append(path)
+                elif mtype.startswith("audio/"):
+                    reply_audio_paths.append(path)
+                else:
+                    reply_file_paths.append(path)
+
+            reply_context_parts: list[str] = []
+            if reply_image_paths:
+                image_context = await self._enrich_message_with_vision(
+                    "[The user replied to a message that contains image(s).]",
+                    reply_image_paths,
+                )
+                image_context = image_context.replace(
+                    "[The user sent an image~",
+                    "[The message the user replied to contains an image~",
+                ).replace(
+                    "[The user sent an image",
+                    "[The message the user replied to contains an image",
+                )
+                reply_context_parts.append(image_context)
+            if reply_audio_paths:
+                audio_context = await self._enrich_message_with_transcription(
+                    "[The user replied to a message that contains voice/audio.]",
+                    reply_audio_paths,
+                )
+                audio_context = audio_context.replace(
+                    "[The user sent a voice message~",
+                    "[The message the user replied to contains a voice message~",
+                ).replace(
+                    "[The user sent a voice message",
+                    "[The message the user replied to contains a voice message",
+                )
+                reply_context_parts.append(audio_context)
+            for path in reply_file_paths:
+                reply_context_parts.append(
+                    f"[The message the user replied to contains a file saved at: {path}]"
+                )
+            if reply_context_parts:
+                media_context = "\n\n".join(reply_context_parts)
+                message_text = f"[Replied-to message media context]\n{media_context}\n\n{message_text}"
+
         if getattr(event, "reply_to_text", None) and event.reply_to_message_id:
             # Always inject the reply-to pointer — even when the quoted text
             # already appears in history. The prefix isn't deduplication, it's
@@ -10868,7 +10931,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass
 
-        session_entry = self.session_store.get_or_create_session(source)
+        session_key_override = str(getattr(event, "session_key_override", "") or "").strip() or None
+        session_entry = self.session_store.get_or_create_session(
+            source,
+            session_key_override=session_key_override,
+        )
         session_key = session_entry.session_key
         pinned_session_id = str(
             (getattr(event, "metadata", None) or {}).get("gateway_session_id") or ""
@@ -17895,6 +17962,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         channel_prompt: Optional[str] = None,
         guest_mode_invocation: bool = False,
     ) -> Dict[str, Any]:
+
         """
         Run the agent with the given message and context.
         
@@ -18019,6 +18087,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return "generic" if allow_generic else "off"
             return "raw" if bool(value) else "off"
 
+        from gateway.status_phrases import choose_status_phrase, resolve_status_phrase_catalog
+        _generic_status_recent: List[str] = []
+        _generic_status_catalog = resolve_status_phrase_catalog(user_config, platform_key)
+
+        def _generic_status_phrase(kind: str, *, tool_name: str | None = None, preview: str | None = None, args: Any = None) -> str:
+            try:
+                return choose_status_phrase(
+                    kind,
+                    tool_name=tool_name,
+                    preview=preview,
+                    args=args,
+                    recent=_generic_status_recent,
+                    catalog=_generic_status_catalog,
+                )
+            except Exception as _phrase_err:
+                logger.debug("generic status phrase selection failed: %s", _phrase_err)
+                return "still on it" if kind in {"heartbeat", "waiting", "long_running", "status"} else "one sec"
+
+        if is_guest_turn:
+            # Guest Bot answers are public, one-bubble interactions in chats
+            # Hermes is not a member of. Keep them safe and short by default:
+            # pre-processing may still use vision/STT, but the agent itself
+            # gets no tool surface unless the operator explicitly opts in via
+            # telegram.guest_mode_toolsets / telegram.guest_tools.
+            telegram_cfg = user_config.get("telegram") or {}
+            raw_guest_toolsets = []
+            if isinstance(telegram_cfg, dict):
+                raw_guest_toolsets = (
+                    telegram_cfg.get("guest_mode_toolsets")
+                    or telegram_cfg.get("guest_tools")
+                    or []
+                )
+            if isinstance(raw_guest_toolsets, str):
+                raw_guest_toolsets = [part.strip() for part in raw_guest_toolsets.split(",") if part.strip()]
+            if raw_guest_toolsets:
+                enabled_toolsets = sorted(str(toolset) for toolset in raw_guest_toolsets)
+            else:
+                enabled_toolsets = []
         # Disable tool progress for webhooks - they don't support message editing,
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform
@@ -20563,7 +20669,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Use session_key (not source.chat_id) to match adapter's storage keys.
             pending_event = None
             pending = None
-            if result and adapter and session_key:
+            if result and adapter and session_key and not _is_telegram_guest_source(source):
+                # Normal chats have a stable delivery target, so the runner can
+                # consume and process queued follow-ups in-band. Telegram Guest
+                # Mode uses a one-shot guest_query_id as chat_id; leaving the
+                # pending event in the adapter lets BasePlatformAdapter spawn a
+                # fresh task with the follow-up event.source, so the final edit
+                # targets the correct guest bubble instead of the previous query.
                 pending_event = _dequeue_pending_event(adapter, session_key)
                 # /queue overflow: after consuming the adapter's "next-up"
                 # slot, promote the next queued event into it so the
