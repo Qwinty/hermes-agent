@@ -186,8 +186,12 @@ except ImportError:
     TypeHandler = Any
     HTTPXRequest = Any
     filters = None
-    ParseMode = None
-    ChatType = None
+    # Keep lightweight constants available for unit tests and best-effort
+    # formatting fallbacks when python-telegram-bot is not importable at module
+    # import time. check_telegram_requirements() replaces these with the real
+    # PTB constants once the dependency is available.
+    ParseMode = SimpleNamespace(MARKDOWN_V2="MarkdownV2", MARKDOWN="Markdown", HTML="HTML")
+    ChatType = SimpleNamespace(GROUP="group", SUPERGROUP="supergroup", CHANNEL="channel", PRIVATE="private")
 
     # Mock ContextTypes so type annotations using ContextTypes.DEFAULT_TYPE
     # don't crash during class definition when the library isn't installed.
