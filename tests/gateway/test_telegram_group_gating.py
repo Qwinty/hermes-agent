@@ -1276,6 +1276,14 @@ def test_raw_guest_update_routes_via_guest_query_id_and_caller_user():
         "text": "@hermes_bot ping",
         "guest_query_id": "guest-query-1",
         "guest_bot_caller_user": {"id": 273403055, "is_bot": False, "first_name": "Maxim"},
+        "guest_bot_caller_chat": {"id": -100123, "type": "supergroup", "title": "Guest Chat"},
+        "reply_to_message": {
+            "message_id": 122,
+            "date": 0,
+            "chat": {"id": 555, "type": "private", "first_name": "Target"},
+            "from": {"id": 999, "is_bot": True, "first_name": "Hermes"},
+            "text": "предыдущий ответ",
+        },
     }
     update = SimpleNamespace(update_id=77, api_kwargs={"guest_message": raw_guest})
 
@@ -1284,9 +1292,198 @@ def test_raw_guest_update_routes_via_guest_query_id_and_caller_user():
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
     assert event.text == "ping"
+    assert event.reply_to_text == "предыдущий ответ"
+    assert event.reply_to_message_id == "122"
+    assert event.guest_mode_invocation is True
     assert event.source.chat_id == "guest:guest-query-1"
     assert event.source.user_id == "273403055"
     assert event.source.user_name == "Maxim"
+    assert event.session_key_override.startswith("telegram:guest-session:-100123:message:122:")
+    assert "[Telegram Guest Mode]" in event.channel_prompt
+    assert "DM fallback" in event.channel_prompt
+
+
+def test_raw_guest_reply_chain_reuses_session_key_override():
+    adapter = _make_adapter(guest_mode=True)
+    adapter.handle_message = AsyncMock()
+
+    first_guest = {
+        "message_id": 123,
+        "date": 0,
+        "chat": {"id": 555, "type": "private", "first_name": "Target"},
+        "from": {"id": 111, "is_bot": False, "first_name": "Sender"},
+        "text": "@hermes_bot first",
+        "guest_query_id": "guest-query-1",
+        "guest_bot_caller_user": {"id": 273403055, "is_bot": False, "first_name": "Maxim"},
+        "guest_bot_caller_chat": {"id": -100123, "type": "supergroup", "title": "Guest Chat"},
+    }
+    asyncio.run(adapter._handle_guest_update(SimpleNamespace(update_id=77, api_kwargs={"guest_message": first_guest}), SimpleNamespace()))
+    first_event = adapter.handle_message.await_args.args[0]
+
+    adapter.handle_message.reset_mock()
+    second_guest = {
+        "message_id": 124,
+        "date": 0,
+        "chat": {"id": 555, "type": "private", "first_name": "Target"},
+        "from": {"id": 111, "is_bot": False, "first_name": "Sender"},
+        "text": "@hermes_bot follow-up",
+        "guest_query_id": "guest-query-2",
+        "guest_bot_caller_user": {"id": 273403055, "is_bot": False, "first_name": "Maxim"},
+        "guest_bot_caller_chat": {"id": -100123, "type": "supergroup", "title": "Guest Chat"},
+        "reply_to_message": {
+            "message_id": 9001,
+            "date": 0,
+            "chat": {"id": 555, "type": "private", "first_name": "Target"},
+            "from": {"id": 999, "is_bot": True, "first_name": "Hermes"},
+            "text": "previous answer",
+            "guest_query_id": "guest-query-1",
+        },
+    }
+
+    asyncio.run(adapter._handle_guest_update(SimpleNamespace(update_id=78, api_kwargs={"guest_message": second_guest}), SimpleNamespace()))
+
+    second_event = adapter.handle_message.await_args.args[0]
+    assert second_event.source.chat_id == "guest:guest-query-2"
+    assert second_event.session_key_override == first_event.session_key_override
+
+
+def test_raw_guest_reply_to_photo_and_voice_caches_reply_media(monkeypatch):
+    import gateway.platforms.telegram as telegram_mod
+
+    adapter = _make_adapter(guest_mode=True)
+    adapter.handle_message = AsyncMock()
+
+    class FakeFile:
+        file_path = "photos/reply.jpg"
+
+        async def download_as_bytearray(self):
+            return bytearray(b"fake-bytes")
+
+    adapter._bot = SimpleNamespace(
+        id=999,
+        username="hermes_bot",
+        get_file=AsyncMock(return_value=FakeFile()),
+    )
+    monkeypatch.setattr(telegram_mod, "cache_image_from_bytes", lambda payload, ext=".jpg": f"/tmp/reply{ext}")
+    monkeypatch.setattr(telegram_mod, "cache_audio_from_bytes", lambda payload, ext=".ogg": f"/tmp/reply_voice{ext}")
+
+    raw_guest = {
+        "message_id": 125,
+        "date": 0,
+        "chat": {"id": 555, "type": "private", "first_name": "Target"},
+        "from": {"id": 111, "is_bot": False, "first_name": "Sender"},
+        "text": "@hermes_bot что на фото и в голосовом?",
+        "guest_query_id": "guest-query-media",
+        "guest_bot_caller_user": {"id": 273403055, "is_bot": False, "first_name": "Maxim"},
+        "guest_bot_caller_chat": {"id": -100123, "type": "supergroup", "title": "Guest Chat"},
+        "reply_to_message": {
+            "message_id": 124,
+            "date": 0,
+            "chat": {"id": 555, "type": "private", "first_name": "Target"},
+            "from": {"id": 222, "is_bot": False, "first_name": "Other"},
+            "caption": "контекст к фото",
+            "photo": [
+                {"file_id": "small", "file_unique_id": "s", "width": 90, "height": 90, "file_size": 100},
+                {"file_id": "big", "file_unique_id": "b", "width": 1280, "height": 720, "file_size": 1000},
+            ],
+            "voice": {"file_id": "voice-1", "file_unique_id": "v", "duration": 3, "mime_type": "audio/ogg"},
+        },
+    }
+
+    asyncio.run(adapter._handle_guest_update(SimpleNamespace(update_id=79, api_kwargs={"guest_message": raw_guest}), SimpleNamespace()))
+
+    event = adapter.handle_message.await_args.args[0]
+    assert event.reply_to_text == "контекст к фото"
+    assert event.reply_to_media_urls == ["/tmp/reply.jpg", "/tmp/reply_voice.ogg"]
+    assert event.reply_to_media_types == ["image/jpeg", "audio/ogg"]
+    assert adapter._bot.get_file.await_count == 2
+
+
+def test_replied_media_is_injected_into_prepared_message_text():
+    from gateway.config import Platform
+    from gateway.platforms.base import MessageEvent, MessageType
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = SimpleNamespace(group_sessions_per_user=True, thread_sessions_per_user=False)
+    runner._pending_native_image_paths_by_session = {}
+
+    async def fake_vision(user_text, image_paths):
+        assert image_paths == ["/tmp/reply.jpg"]
+        return "[The user sent an image~ image description]"
+
+    async def fake_transcription(user_text, audio_paths):
+        assert audio_paths == ["/tmp/reply.ogg"]
+        return '[The user sent a voice message~ Here\'s what they said: "hello"]'
+
+    runner._enrich_message_with_vision = fake_vision
+    runner._enrich_message_with_transcription = fake_transcription
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="guest:guest-query-media",
+        chat_type="dm",
+        user_id="273403055",
+    )
+    event = MessageEvent(
+        text="что там?",
+        message_type=MessageType.TEXT,
+        source=source,
+        reply_to_message_id="124",
+        reply_to_text="контекст",
+        reply_to_media_urls=["/tmp/reply.jpg", "/tmp/reply.ogg"],
+        reply_to_media_types=["image/jpeg", "audio/ogg"],
+        session_key_override="telegram:guest-session:-100123:query:q1:273403055",
+    )
+
+    prepared = asyncio.run(
+        GatewayRunner._prepare_inbound_message_text(
+            runner,
+            event=event,
+            source=source,
+            history=[],
+        )
+    )
+
+    assert "[Replied-to message media context]" in prepared
+    assert "message the user replied to contains an image" in prepared
+    assert "message the user replied to contains a voice message" in prepared
+    assert '[Replying to: "контекст"]' in prepared
+    assert prepared.endswith("что там?")
+
+
+def test_guest_context_normalizes_ptb_api_kwargs_shape():
+    adapter = _make_adapter(guest_mode=True)
+    guest_message = SimpleNamespace(
+        message_id=123,
+        date=0,
+        chat=SimpleNamespace(id=555, type="private", full_name="Target", title=None, is_forum=False),
+        from_user=SimpleNamespace(id=111, full_name="Sender", username=None),
+        text="@hermes_bot ping",
+        caption=None,
+        entities=[],
+        caption_entities=[],
+        message_thread_id=None,
+        is_topic_message=False,
+        reply_to_message=None,
+        quote=None,
+        api_kwargs={
+            "guest_query_id": "guest-query-2",
+            "guest_bot_caller_user": {"id": 273403055, "first_name": "Maxim"},
+            "guest_bot_caller_chat": {"id": -100123, "title": "Guest Chat"},
+        },
+    )
+    update = SimpleNamespace(update_id=78, guest_message=guest_message, api_kwargs={})
+
+    ctx = adapter._guest_context_from_update(update)
+
+    assert ctx is not None
+    assert ctx.guest_query_id == "guest-query-2"
+    assert ctx.caller_user_id == "273403055"
+    assert ctx.caller_user_name == "Maxim"
+    assert ctx.caller_chat_id == "-100123"
+    assert ctx.caller_chat_name == "Guest Chat"
 
 
 def test_send_guest_chat_uses_answer_guest_query():
