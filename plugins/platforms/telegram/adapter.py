@@ -389,6 +389,25 @@ class TelegramAdapter(BasePlatformAdapter):
         """Telegram measures message length in UTF-16 code units."""
         return utf16_len
 
+    @staticmethod
+    def _media_message_filter():
+        """Return the Telegram filter used for all inbound media messages."""
+        telegram_filters = filters
+        if telegram_filters is None:
+            raise RuntimeError("python-telegram-bot filters are unavailable")
+        media_filter = (
+            telegram_filters.PHOTO
+            | telegram_filters.VIDEO
+            | telegram_filters.AUDIO
+            | telegram_filters.VOICE
+            | telegram_filters.Document.ALL
+            | telegram_filters.Sticker.ALL
+        )
+        video_note_filter = getattr(telegram_filters, "VIDEO_NOTE", None)
+        if video_note_filter is not None:
+            media_filter = media_filter | video_note_filter
+        return media_filter
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.TELEGRAM)
         self._app: Optional[Application] = None
@@ -3132,7 +3151,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._handle_location_message
             ))
             self._app.add_handler(TelegramMessageHandler(
-                filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
+                self._media_message_filter(),
                 self._handle_media_message
             ))
             # Bot API 10.0 guest messages are not modeled by PTB 22.x yet, so
@@ -6958,6 +6977,8 @@ class TelegramAdapter(BasePlatformAdapter):
             return MessageType.STICKER
         if msg.photo:
             return MessageType.PHOTO
+        if getattr(msg, "video_note", None):
+            return MessageType.VIDEO_NOTE
         if msg.video:
             return MessageType.VIDEO
         if msg.audio:
@@ -7374,7 +7395,7 @@ class TelegramAdapter(BasePlatformAdapter):
             "message_id", "date", "chat", "from", "text", "caption",
             "entities", "caption_entities", "message_thread_id",
             "is_topic_message", "reply_to_message", "quote", "photo",
-            "voice", "audio", "document", "video", "sticker",
+            "voice", "audio", "document", "video", "video_note", "sticker",
         }
         return SimpleNamespace(
             message_id=raw.get("message_id"),
@@ -7394,6 +7415,7 @@ class TelegramAdapter(BasePlatformAdapter):
             audio=_as_namespace(raw.get("audio")),
             document=_as_namespace(raw.get("document")),
             video=_as_namespace(raw.get("video")),
+            video_note=_as_namespace(raw.get("video_note")),
             sticker=_as_namespace(raw.get("sticker")),
             api_kwargs={k: v for k, v in raw.items() if k not in excluded},
         )
@@ -7988,6 +8010,23 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning("[Telegram] Failed to cache audio: %s", e, exc_info=True)
                 await self._surface_media_cache_failure(msg, event, "audio file", e)
+
+        elif getattr(msg, "video_note", None):
+            try:
+                file_obj = await msg.video_note.get_file()
+                video_bytes = await file_obj.download_as_bytearray()
+                ext = ".mp4"
+                if getattr(file_obj, "file_path", None):
+                    for candidate in SUPPORTED_VIDEO_TYPES:
+                        if file_obj.file_path.lower().endswith(candidate):
+                            ext = candidate
+                            break
+                cached_path = cache_video_from_bytes(bytes(video_bytes), ext=ext)
+                event.media_urls = [cached_path]
+                event.media_types = [SUPPORTED_VIDEO_TYPES.get(ext, "video/mp4")]
+                logger.info("[Telegram] Cached user video note at %s", cached_path)
+            except Exception as e:
+                logger.warning("[Telegram] Failed to cache video note: %s", e, exc_info=True)
 
         elif msg.video:
             try:
