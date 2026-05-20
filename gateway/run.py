@@ -10577,7 +10577,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # MessageType.VOICE = voice message (Opus/OGG) — always STT
                 if event.message_type == MessageType.AUDIO:
                     audio_file_paths.append(path)
-                elif event.message_type == MessageType.VOICE or (
+                elif event.message_type in {MessageType.VOICE, MessageType.VIDEO_NOTE} or (
                     mtype.startswith("audio/")
                     and event.message_type not in {MessageType.AUDIO, MessageType.DOCUMENT}
                 ):
@@ -10614,9 +10614,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
 
             if audio_paths:
+                media_label = (
+                    "video note"
+                    if event.message_type == MessageType.VIDEO_NOTE
+                    else "voice message"
+                )
                 message_text, _successful_transcripts = await self._enrich_message_with_transcription(
                     message_text,
                     audio_paths,
+                    media_label=media_label,
                 )
                 # Echo each successful transcript back to the user immediately
                 # when configured. Lets users verify STT quality in real-time,
@@ -10781,7 +10787,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 reply_context_parts.append(image_context)
             if reply_audio_paths:
-                audio_context = await self._enrich_message_with_transcription(
+                audio_context, _ = await self._enrich_message_with_transcription(
                     "[The user replied to a message that contains voice/audio.]",
                     reply_audio_paths,
                 )
@@ -16218,6 +16224,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self,
         user_text: str,
         audio_paths: List[str],
+        media_label: str = "voice message",
     ) -> tuple[str, List[str]]:
         """
         Auto-transcribe user voice/audio messages using the configured STT provider
@@ -16225,7 +16232,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         Args:
             user_text:   The user's original caption / message text.
-            audio_paths: List of local file paths to cached audio files.
+            audio_paths: List of local file paths to cached audio/video-note files.
+            media_label: Human-readable label for the media in injected context.
 
         Returns:
             A tuple of ``(enriched_text, successful_transcripts)``:
@@ -16243,10 +16251,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 duration_str = await _probe_audio_duration(abs_path)
                 if duration_str:
                     notes.append(
-                        f"[The user sent a voice message: {abs_path} (duration: {duration_str})]"
+                        f"[The user sent a {media_label}: {abs_path} (duration: {duration_str})]"
                     )
                 else:
-                    notes.append(f"[The user sent a voice message: {abs_path}]")
+                    notes.append(f"[The user sent a {media_label}: {abs_path}]")
             if not notes:
                 return user_text, []
             prefix = "\n\n".join(notes)
@@ -16272,7 +16280,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # earlier wording ("The user sent a voice message~ Here's
                     # what they said: ...") read as a meta-instruction and made
                     # the LLM volunteer commentary about voice mode rather than
-                    # reply to the content.
+                    # reply to the content. Keep this neutral for all transcribable
+                    # audio-like media, including Telegram video notes.
                     enriched_parts.append(f'"{transcript}"')
                 else:
                     error = result.get("error", "unknown error")
@@ -16285,11 +16294,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # even after transcription starts working. The cause is
                     # logged for operator diagnosis but kept out of the
                     # LLM-visible prompt.
-                    logger.info("Voice transcription failed for %s: %s", path, error)
-                    enriched_parts.append("[voice message could not be transcribed]")
+                    logger.info("Transcription failed for %s (%s): %s", path, media_label, error)
+                    enriched_parts.append(f"[{media_label} could not be transcribed]")
             except Exception as e:
                 logger.error("Transcription error: %s", e)
-                enriched_parts.append("[voice message could not be transcribed]")
+                enriched_parts.append(f"[{media_label} could not be transcribed]")
 
         if enriched_parts:
             prefix = "\n\n".join(enriched_parts)
@@ -16336,7 +16345,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             mtype = media_types[i] if i < len(media_types) else ""
             is_audio = (
                 mtype.startswith("audio/")
-                or getattr(event, "message_type", None) in (MessageType.VOICE, MessageType.AUDIO)
+                or getattr(event, "message_type", None)
+                in (MessageType.VOICE, MessageType.AUDIO, MessageType.VIDEO_NOTE)
             )
             if is_audio:
                 audio_paths.append(path)
@@ -20281,7 +20291,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _mtype = _media_types[_i] if _i < len(_media_types) else ""
                                     _is_audio = (
                                         _mtype.startswith("audio/")
-                                        or getattr(_peek_event, "message_type", None) in (MessageType.VOICE, MessageType.AUDIO)
+                                        or getattr(_peek_event, "message_type", None)
+                                        in (MessageType.VOICE, MessageType.AUDIO, MessageType.VIDEO_NOTE)
                                     )
                                     if _is_audio:
                                         _audio_paths.append(_path)
@@ -20709,7 +20720,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _mtype = _media_types[_i] if _i < len(_media_types) else ""
                         _is_audio = (
                             _mtype.startswith("audio/")
-                            or getattr(pending_event, "message_type", None) in (MessageType.VOICE, MessageType.AUDIO)
+                            or getattr(pending_event, "message_type", None)
+                            in (MessageType.VOICE, MessageType.AUDIO, MessageType.VIDEO_NOTE)
                         )
                         if _is_audio:
                             _audio_paths.append(_path)
