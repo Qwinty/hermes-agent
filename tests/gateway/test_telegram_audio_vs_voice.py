@@ -53,6 +53,16 @@ def _audio_event(path: str = "/tmp/song.mp3") -> MessageEvent:
     )
 
 
+def _video_note_event(path: str = "/tmp/video-note.mp4") -> MessageEvent:
+    return MessageEvent(
+        text="",
+        message_type=MessageType.VIDEO_NOTE,
+        source=SessionSource(platform=Platform.TELEGRAM, chat_id="1", chat_type="dm"),
+        media_urls=[path],
+        media_types=["video/mp4"],
+    )
+
+
 # ---------------------------------------------------------------------------
 # 1. VOICE still goes through STT
 # ---------------------------------------------------------------------------
@@ -78,6 +88,28 @@ async def test_voice_message_still_transcribed():
     # The transcript passes through as a plain quoted line — no "voice message"
     # meta-commentary in the LLM-visible prompt.
     assert "hello world" in result
+
+
+@pytest.mark.asyncio
+async def test_video_note_message_is_transcribed_from_mp4():
+    """Telegram video notes are MP4 containers but should still use the STT path."""
+    runner = _make_runner(stt_enabled=True)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="1", chat_type="dm")
+    event = _video_note_event("/tmp/video-note.mp4")
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={"success": True, "transcript": "video note words", "provider": "whisper"},
+    ) as mock_transcribe:
+        result = await runner._prepare_inbound_message_text(
+            event=event,
+            source=source,
+            history=[],
+        )
+
+    mock_transcribe.assert_called_once_with("/tmp/video-note.mp4")
+    assert "video note words" in result
+    assert "video note" in result.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -185,5 +217,7 @@ def test_telegram_media_type_detection_audio_vs_voice():
     # Check the constants match expected semantic roles.
     assert MessageType.AUDIO.value == "audio"
     assert MessageType.VOICE.value == "voice"
+    assert MessageType.VIDEO_NOTE.value == "video_note"
     # Sanity: they are distinct
     assert MessageType.AUDIO != MessageType.VOICE
+    assert MessageType.VIDEO_NOTE != MessageType.VIDEO

@@ -1699,6 +1699,7 @@ class MessageType(Enum):
     LOCATION = "location"
     PHOTO = "photo"
     VIDEO = "video"
+    VIDEO_NOTE = "video_note"
     AUDIO = "audio"
     VOICE = "voice"
     DOCUMENT = "document"
