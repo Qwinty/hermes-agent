@@ -340,6 +340,30 @@ class TestCompletionConsumed:
         assert result["status"] == "exited"
         assert registry.is_completion_consumed("proc_log")
 
+    def test_kill_marks_completion_consumed(self, registry):
+        """kill() is an explicit agent consumption path.
+
+        If a notify_on_complete process is killed by the agent, the later
+        watcher/drain pass must not inject a synthetic completion turn for the
+        same process.
+        """
+        s = _make_session(
+            sid="proc_kill",
+            notify_on_complete=True,
+            output="partial output",
+        )
+        s.pid = 12345
+        s.env_ref = MagicMock()
+        s.env_ref.execute.return_value = {"exit_code": 0}
+        registry._running[s.id] = s
+
+        with patch.object(registry, "_write_checkpoint"):
+            result = registry.kill_process("proc_kill")
+
+        assert result["status"] == "killed"
+        assert registry.is_completion_consumed("proc_kill")
+        assert registry.drain_notifications() == []
+
     def test_running_process_not_consumed(self, registry):
         """poll() on a still-running process does not mark as consumed."""
         s = _make_session(sid="proc_running", notify_on_complete=True, output="partial")

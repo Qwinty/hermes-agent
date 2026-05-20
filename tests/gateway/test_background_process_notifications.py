@@ -358,6 +358,60 @@ async def test_agent_notification_no_message_id_is_tolerated(monkeypatch, tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_agent_killed_notify_process_does_not_reenter_session(monkeypatch, tmp_path):
+    """Agent-initiated kill must not create a second synthetic completion turn.
+
+    Regression for a Telegram DM Topic duplicate: the agent killed a
+    notify_on_complete process, sent its final reply, then the process watcher
+    injected the killed process completion as a fresh internal user message.
+    """
+    import time
+
+    import tools.process_registry as pr_module
+    from tools.process_registry import ProcessRegistry, ProcessSession
+
+    registry = ProcessRegistry()
+    session = ProcessSession(
+        id="proc_killed_notify",
+        command="python transcribe.py",
+        started_at=time.time(),
+        output_buffer="LANG ru 1\n",
+        notify_on_complete=True,
+        pid=12345,
+        env_ref=SimpleNamespace(execute=lambda *_a, **_kw: {"exit_code": 0}),
+    )
+    registry._running[session.id] = session
+    with patch.object(registry, "_write_checkpoint"):
+        assert registry.kill_process(session.id)["status"] == "killed"
+
+    monkeypatch.setattr(pr_module, "process_registry", registry)
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    adapter = runner.adapters[Platform.TELEGRAM]
+
+    await runner._run_process_watcher(
+        {
+            "session_id": session.id,
+            "check_interval": 0,
+            "session_key": "agent:main:telegram:dm:123:24296",
+            "platform": "telegram",
+            "chat_id": "123",
+            "thread_id": "24296",
+            "message_id": "555",
+            "notify_on_complete": True,
+        }
+    )
+
+    adapter.handle_message.assert_not_awaited()
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_inject_watch_notification_carries_message_id_reply_anchor(monkeypatch, tmp_path):
     from gateway.session import SessionSource
 

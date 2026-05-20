@@ -168,7 +168,7 @@ class ProcessRegistry:
         self.completion_queue: _queue_mod.Queue = _queue_mod.Queue()
 
         # Track sessions whose completion was already consumed by the agent
-        # via wait/poll/log.  Drain loops skip notifications for these.
+        # via wait/poll/log/kill.  Drain loops skip notifications for these.
         self._completion_consumed: set = set()
 
         # Global watch-match circuit breaker — across all sessions.
@@ -830,7 +830,7 @@ class ProcessRegistry:
     # ----- Query Methods -----
 
     def is_completion_consumed(self, session_id: str) -> bool:
-        """Check if a completion notification was already consumed via wait/poll/log."""
+        """Check if a completion notification was already consumed via wait/poll/log/kill."""
         return session_id in self._completion_consumed
 
     def drain_notifications(self) -> "list[tuple[dict, str]]":
@@ -1077,6 +1077,7 @@ class ProcessRegistry:
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
 
         if session.exited:
+            self._completion_consumed.add(session_id)
             return {
                 "status": "already_exited",
                 "exit_code": session.exit_code,
@@ -1118,6 +1119,7 @@ class ProcessRegistry:
                     with session._lock:
                         session.exited = True
                         session.exit_code = None
+                    self._completion_consumed.add(session_id)
                     self._move_to_finished(session)
                     return {
                         "status": "already_exited",
@@ -1132,6 +1134,7 @@ class ProcessRegistry:
                         "its original runtime handle is no longer available"
                     ),
                 }
+            self._completion_consumed.add(session_id)
             session.exited = True
             session.exit_code = -15  # SIGTERM
             self._move_to_finished(session)

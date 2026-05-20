@@ -14710,9 +14710,15 @@ class GatewayRunner:
 
             if session.exited:
                 # --- Agent-triggered completion: inject synthetic message ---
-                # Skip if the agent already consumed the result via wait/poll/log
+                # Skip if the agent already consumed the result via wait/poll/log/kill.
+                # Do not fall through to the user-facing text notification for
+                # consumed agent-notify watchers; the agent has already handled
+                # the completion explicitly in-band.
                 from tools.process_registry import process_registry as _pr_check
-                if agent_notify and not _pr_check.is_completion_consumed(session_id):
+                if agent_notify and _pr_check.is_completion_consumed(session_id):
+                    logger.debug("Process watcher skipping consumed completion: %s", session_id)
+                    break
+                if agent_notify:
                     from tools.ansi_strip import strip_ansi
                     _raw = strip_ansi(session.output_buffer) if session.output_buffer else ""
                     # Truncate at line boundaries so notifications never start
