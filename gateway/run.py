@@ -430,6 +430,31 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
     return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
 
 
+_GATEWAY_SYNTHETIC_FAILURE_PREFIXES = (
+    "⚠️ Provider authentication failed",
+    "⏱️ The model provider is rate-limiting",
+    "⚠️ The model provider failed after retries",
+    "⚠️ Session too large for the model's context window.",
+    "The request failed:",
+    "⚠️ Processing stopped:",
+    "⚠️ Processing completed but no response was generated.",
+    "Sorry, I encountered an error",
+)
+
+
+def _looks_like_gateway_synthetic_failure(text: str) -> bool:
+    """True when a final-looking reply is gateway error text, not model work."""
+    if not text:
+        return False
+    body = str(text).strip()
+    if not body:
+        return False
+    if _looks_like_gateway_provider_error(body):
+        return True
+    lowered = body.lower()
+    return any(lowered.startswith(prefix.lower()) for prefix in _GATEWAY_SYNTHETIC_FAILURE_PREFIXES)
+
+
 def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     """Sanitize final gateway replies before sending them to chat surfaces.
 
@@ -2510,7 +2535,33 @@ def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
         return False
     if agent_result.get("completed") is False:
         return False
+    final_response = str(agent_result.get("final_response") or "")
+    if _looks_like_gateway_synthetic_failure(final_response):
+        return False
     return True
+
+
+def _should_run_post_turn_goal_continuation(agent_result: Any) -> bool:
+    """Return True only after a real agent final answer, not gateway failures."""
+    if isinstance(agent_result, dict):
+        if (
+            agent_result.get("failed")
+            or agent_result.get("partial")
+            or agent_result.get("interrupted")
+            or agent_result.get("error")
+            or agent_result.get("compression_exhausted")
+            or agent_result.get("completed") is False
+        ):
+            return False
+        final_response = str(agent_result.get("final_response") or "")
+    elif isinstance(agent_result, str):
+        final_response = agent_result
+    else:
+        return False
+
+    if not final_response.strip():
+        return False
+    return not _looks_like_gateway_synthetic_failure(final_response)
 
 
 def _preserve_queued_followup_history_offset(
@@ -9804,10 +9855,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _final_text = str(_agent_result.get("final_response") or "")
                 elif isinstance(_agent_result, str):
                     _final_text = _agent_result
-                # Skip for empty responses (interrupted / errored) — the
-                # judge would almost always say "continue" and we'd loop
-                # on error. Let the user drive the next turn.
-                if _final_text.strip():
+                # Skip for empty responses and gateway/provider failures — the
+                # judge would almost always say "continue" and we'd loop on
+                # infrastructure errors. Let the user drive the next turn.
+                if _should_run_post_turn_goal_continuation(_agent_result):
                     try:
                         session_entry = self.session_store.get_or_create_session(
                             source,
@@ -16972,6 +17023,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "messages": [],
                     "api_calls": 0,
                     "tools": [],
+                    "failed": True,
+                    "completed": False,
+                    "error": str(exc),
                 }
 
             pr = self._provider_routing
