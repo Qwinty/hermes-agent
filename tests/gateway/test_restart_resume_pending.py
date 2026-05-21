@@ -69,6 +69,12 @@ def test_resume_pending_is_cleared_only_after_successful_turn():
     assert _should_clear_resume_pending_after_turn({"failed": True}) is False
     assert _should_clear_resume_pending_after_turn({"partial": True}) is False
     assert _should_clear_resume_pending_after_turn({"error": "boom"}) is False
+    assert _should_clear_resume_pending_after_turn(
+        {"final_response": "⚠️ Provider authentication failed: credential_pool_exhausted"}
+    ) is False
+    assert _should_clear_resume_pending_after_turn(
+        {"final_response": "⏱️ The model provider is rate-limiting requests. Please wait."}
+    ) is False
 
 
 def _make_source(platform=Platform.TELEGRAM, chat_id="123", user_id="u1"):
