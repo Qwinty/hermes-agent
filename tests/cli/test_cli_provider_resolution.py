@@ -477,6 +477,44 @@ def test_codex_provider_strips_provider_prefix_from_model(monkeypatch):
     assert shell.model == "gpt-5.3-codex"
 
 
+def test_chat_model_custom_provider_spec_routes_before_codex_normalization(monkeypatch):
+    """`hermes chat -m custom:Name/model` carries both provider and model.
+
+    It should not fall through to the configured default provider where the
+    Codex normalizer strips the custom provider prefix and sends an unsupported
+    bare model slug to ChatGPT.
+    """
+    cli = _import_cli()
+
+    resolved_requests = []
+
+    def _runtime_resolve(**kwargs):
+        resolved_requests.append(kwargs.get("requested"))
+        return {
+            "provider": "custom:AntigravityManager",
+            "api_mode": "chat_completions",
+            "base_url": "http://127.0.0.1:8045/v1",
+            "api_key": "test-key",
+            "source": "custom-provider",
+        }
+
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", _runtime_resolve)
+    monkeypatch.setattr("hermes_cli.runtime_provider.format_runtime_provider_error", lambda exc: str(exc))
+
+    shell = cli.HermesCLI(
+        model="custom:AntigravityManager/gemini-3.5-flash-low",
+        compact=True,
+        max_turns=1,
+    )
+
+    assert shell.requested_provider == "custom:AntigravityManager"
+    assert shell.model == "gemini-3.5-flash-low"
+    assert shell._ensure_runtime_credentials() is True
+    assert resolved_requests == ["custom:AntigravityManager"]
+    assert shell.provider == "custom:AntigravityManager"
+    assert shell.model == "gemini-3.5-flash-low"
+
+
 def test_cmd_model_falls_back_to_auto_on_invalid_provider(monkeypatch, capsys):
     monkeypatch.setattr(
         "hermes_cli.config.load_config",

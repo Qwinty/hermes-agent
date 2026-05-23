@@ -2916,6 +2916,15 @@ class HermesCLI:
         _model_config = CLI_CONFIG.get("model", {})
         _config_model = (_model_config.get("default") or _model_config.get("model") or "") if isinstance(_model_config, dict) else (_model_config or "")
         _DEFAULT_CONFIG_MODEL = ""
+
+        if model and not provider:
+            _model_text = str(model).strip()
+            if _model_text.lower().startswith("custom:") and "/" in _model_text:
+                _custom_provider, _custom_model = _model_text.split("/", 1)
+                if _custom_provider.strip() and _custom_model.strip():
+                    provider = _custom_provider.strip()
+                    model = _custom_model.strip()
+
         self.model = model or _config_model or _DEFAULT_CONFIG_MODEL
         # Auto-detect model from local server if still on default
         if self.model == _DEFAULT_CONFIG_MODEL:
