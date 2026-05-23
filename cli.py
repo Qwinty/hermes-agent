@@ -3788,7 +3788,46 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         _model_config = CLI_CONFIG.get("model", {})
         _config_model = (_model_config.get("default") or _model_config.get("model") or "") if isinstance(_model_config, dict) else (_model_config or "")
         _DEFAULT_CONFIG_MODEL = ""
-        self.model = model or _config_model or _DEFAULT_CONFIG_MODEL
+        _explicit_model_arg = (model or "").strip()
+        _resolved_model_arg = _explicit_model_arg
+        _resolved_provider_arg = provider
+        _resolved_base_url_arg = base_url
+
+        # `hermes chat -m <alias>` enters through this constructor directly,
+        # unlike top-level `hermes -m ... -z` which uses hermes_cli.oneshot.
+        # Keep the same provider-aware semantics here so config aliases like
+        # `fl: custom:AntigravityManager/gemini-3.5-flash-low` do not fall
+        # through to the configured default provider (often openai-codex).
+        if _explicit_model_arg and not _resolved_provider_arg:
+            try:
+                current_provider_for_alias = (
+                    (_model_config.get("provider") or "") if isinstance(_model_config, dict) else ""
+                ) or os.getenv("HERMES_INFERENCE_PROVIDER", "").strip() or "auto"
+                from hermes_cli.model_switch import resolve_alias
+
+                alias = resolve_alias(_explicit_model_arg, current_provider_for_alias)
+                if alias is not None:
+                    _resolved_provider_arg, _resolved_model_arg, _alias_name = alias
+                    try:
+                        from hermes_cli import model_switch as _ms
+
+                        _ms._ensure_direct_aliases()
+                        direct_alias = _ms.DIRECT_ALIASES.get(_alias_name)
+                        if direct_alias is not None and direct_alias.base_url and not _resolved_base_url_arg:
+                            _resolved_base_url_arg = direct_alias.base_url.rstrip("/")
+                    except Exception:
+                        pass
+                else:
+                    lower_model_arg = _explicit_model_arg.lower()
+                    if lower_model_arg.startswith("custom:") and "/" in _explicit_model_arg:
+                        custom_provider, custom_model = _explicit_model_arg.split("/", 1)
+                        if custom_provider.strip() and custom_model.strip():
+                            _resolved_provider_arg = custom_provider.strip()
+                            _resolved_model_arg = custom_model.strip()
+            except Exception:
+                pass
+
+        self.model = _resolved_model_arg or _config_model or _DEFAULT_CONFIG_MODEL
         # Read max_tokens from config (env var override: HERMES_MAX_TOKENS)
         _env_mt = os.environ.get("HERMES_MAX_TOKENS")
         if _env_mt:
@@ -3824,7 +3863,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         # Provider selection is resolved lazily at use-time via _ensure_runtime_credentials().
         self.requested_provider = (
-            provider
+            _resolved_provider_arg
             or CLI_CONFIG["model"].get("provider")
             or os.getenv("HERMES_INFERENCE_PROVIDER")
             or "auto"
@@ -3835,7 +3874,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         self.acp_command: Optional[str] = None
         self.acp_args: list[str] = []
         self.base_url = (
-            base_url
+            _resolved_base_url_arg
             or CLI_CONFIG["model"].get("base_url", "")
             or os.getenv("OPENROUTER_BASE_URL", "")
         ) or None
