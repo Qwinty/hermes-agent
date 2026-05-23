@@ -93,6 +93,7 @@ DEFAULT_LOCAL_STT_LANGUAGE = "en"
 DEFAULT_STT_MODEL = os.getenv("STT_OPENAI_MODEL", "whisper-1")
 DEFAULT_GROQ_STT_MODEL = os.getenv("STT_GROQ_MODEL", "whisper-large-v3-turbo")
 DEFAULT_MISTRAL_STT_MODEL = os.getenv("STT_MISTRAL_MODEL", "voxtral-mini-latest")
+DEFAULT_ELEVENLABS_STT_MODEL = os.getenv("STT_ELEVENLABS_MODEL", "scribe_v2")
 DEFAULT_DEEPGRAM_STT_MODEL = os.getenv("STT_DEEPGRAM_MODEL", "nova-3")
 LOCAL_STT_COMMAND_ENV = "HERMES_LOCAL_STT_COMMAND"
 LOCAL_STT_LANGUAGE_ENV = "HERMES_LOCAL_STT_LANGUAGE"
@@ -101,6 +102,7 @@ COMMON_LOCAL_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 OPENAI_BASE_URL = os.getenv("STT_OPENAI_BASE_URL", "https://api.openai.com/v1")
 XAI_STT_BASE_URL = os.getenv("XAI_STT_BASE_URL", "https://api.x.ai/v1")
+ELEVENLABS_STT_BASE_URL = os.getenv("ELEVENLABS_STT_BASE_URL", "https://api.elevenlabs.io/v1")
 DEEPGRAM_STT_BASE_URL = os.getenv("DEEPGRAM_STT_BASE_URL", "https://api.deepgram.com/v1")
 
 SUPPORTED_FORMATS = {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", ".ogg", ".aac", ".flac"}
@@ -1494,14 +1496,11 @@ def _transcribe_deepgram(file_path: str, model_name: str) -> Dict[str, Any]:
     if language:
         params["language"] = language
 
-    if "dictation" in deepgram_cfg:
-        params["dictation"] = str(_deepgram_bool(deepgram_cfg.get("dictation"), False)).lower()
-    if "diarize" in deepgram_cfg:
-        params["diarize"] = str(_deepgram_bool(deepgram_cfg.get("diarize"), False)).lower()
-    if "detect_language" in deepgram_cfg:
-        params["detect_language"] = str(_deepgram_bool(deepgram_cfg.get("detect_language"), False)).lower()
-    if "punctuate" in deepgram_cfg:
-        params["punctuate"] = str(_deepgram_bool(deepgram_cfg.get("punctuate"), False)).lower()
+    for optional_bool in ("dictation", "diarize", "detect_language", "punctuate"):
+        if optional_bool in deepgram_cfg:
+            params[optional_bool] = str(
+                _deepgram_bool(deepgram_cfg.get(optional_bool), False)
+            ).lower()
 
     try:
         import mimetypes
@@ -1546,7 +1545,7 @@ def _transcribe_deepgram(file_path: str, model_name: str) -> Dict[str, Any]:
             "Transcribed %s via Deepgram (%s, lang=%s, %d chars)",
             Path(file_path).name,
             model_name,
-            language or result.get("results", {}).get("language"),
+            language or result.get("results", {}).get("language")
             len(transcript_text),
         )
         return {"success": True, "transcript": transcript_text, "provider": "deepgram"}
@@ -1888,7 +1887,8 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
             f"transcription, configure {LOCAL_STT_COMMAND_ENV} or install a local whisper CLI, "
             "set GROQ_API_KEY for free Groq Whisper, set DEEPGRAM_API_KEY for Deepgram, "
             "set MISTRAL_API_KEY for Mistral Voxtral Transcribe, configure xAI OAuth "
-            "or set XAI_API_KEY for xAI Grok STT, or set VOICE_TOOLS_OPENAI_KEY "
+            "or set XAI_API_KEY for xAI Grok STT, set ELEVENLABS_API_KEY for ElevenLabs Scribe, "
+            "or set VOICE_TOOLS_OPENAI_KEY "
             "or OPENAI_API_KEY for the OpenAI Whisper API."
         ),
     }
