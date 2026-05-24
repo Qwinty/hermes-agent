@@ -383,6 +383,18 @@ def _handle_send(args):
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
     mirror_text = cleaned_message.strip() or _describe_media_for_mirror(media_files)
 
+    # If no thread_id was supplied in the target string, fall back to the
+    # current gateway session thread so send_message("telegram", ...) stays in
+    # the originating Telegram topic/thread.
+    if thread_id is None and not target_ref:
+        try:
+            from gateway.session_context import get_session_env
+            _session_thread = get_session_env("HERMES_SESSION_THREAD_ID", "").strip()
+            if _session_thread:
+                thread_id = _session_thread
+        except Exception:
+            pass
+
     used_home_channel = False
     if not chat_id:
         home = config.get_home_channel(platform)
@@ -408,6 +420,11 @@ def _handle_send(args):
     if duplicate_skip:
         return json.dumps(duplicate_skip)
 
+    direct_messages_topic_id = (
+        _telegram_direct_messages_topic_id(chat_id, thread_id)
+        if platform_name == "telegram" else None
+    )
+
     # Slack: resolve user IDs (U...) to DM channel IDs via conversations.open
     if platform_name == "slack" and chat_id and chat_id.startswith("U"):
         try:
@@ -432,15 +449,20 @@ def _handle_send(args):
 
     try:
         from model_tools import _run_async
+        send_kwargs = {
+            "thread_id": thread_id,
+            "media_files": media_files,
+            "force_document": force_document_attachments,
+        }
+        if direct_messages_topic_id is not None:
+            send_kwargs["direct_messages_topic_id"] = direct_messages_topic_id
         result = _run_async(
             _send_to_platform(
                 platform,
                 pconfig,
                 chat_id,
                 cleaned_message,
-                thread_id=thread_id,
-                media_files=media_files,
-                force_document=force_document_attachments,
+                **send_kwargs,
             )
         )
         if used_home_channel and isinstance(result, dict) and result.get("success"):
@@ -577,6 +599,24 @@ def _describe_media_for_mirror(media_files):
             return "[Sent audio attachment]"
         return "[Sent document attachment]"
     return f"[Sent {len(media_files)} media attachments]"
+
+
+def _telegram_direct_messages_topic_id(chat_id, thread_id) -> Optional[str]:
+    """Return direct_messages_topic_id for Telegram private-chat topic sends.
+
+    Forum/supergroup topics use negative chat IDs and still route with
+    message_thread_id. Private bot chats use positive chat IDs; in Bot API 10
+    synthetic/media sends without a reply anchor need direct_messages_topic_id
+    to stay in the visible topic lane.
+    """
+    if not chat_id or not thread_id or str(thread_id) == "1":
+        return None
+    try:
+        if int(str(chat_id)) > 0:
+            return str(thread_id)
+    except (TypeError, ValueError):
+        return None
+    return None
 
 
 def _get_cron_auto_delivery_target():
@@ -720,7 +760,16 @@ async def _send_via_adapter(
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
+async def _send_to_platform(
+    platform,
+    pconfig,
+    chat_id,
+    message,
+    thread_id=None,
+    media_files=None,
+    force_document=False,
+    direct_messages_topic_id=None,
+):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -798,6 +847,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             message,
             media_files=media_files,
             thread_id=thread_id,
+            direct_messages_topic_id=direct_messages_topic_id,
             disable_link_previews=disable_link_previews,
             force_document=force_document,
         )
@@ -1014,7 +1064,16 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
     return "thread not found" in str(error).lower()
 
 
-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
+async def _send_telegram(
+    token,
+    chat_id,
+    message,
+    media_files=None,
+    thread_id=None,
+    direct_messages_topic_id=None,
+    disable_link_previews=False,
+    force_document=False,
+):
     """Send via Telegram Bot API (one-shot, no polling needed).
 
     Applies markdown→MarkdownV2 formatting (same as the gateway adapter)
@@ -1077,7 +1136,9 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         int_chat_id = normalize_telegram_chat_id(chat_id)
         media_files = media_files or []
         thread_kwargs = {}
-        if thread_id is not None:
+        if direct_messages_topic_id is not None:
+            thread_kwargs["direct_messages_topic_id"] = int(direct_messages_topic_id)
+        elif thread_id is not None:
             # Reuse the gateway adapter's General-topic mapping: in Telegram
             # forum supergroups, the General topic is addressed as
             # message_thread_id="1" on incoming updates, but Bot API
@@ -1108,8 +1169,15 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
 
         last_msg = None
         warnings = []
+        caption_for_single_media = None
+        send_text_separately = True
+        if formatted.strip() and len(media_files) == 1:
+            _media_ext = os.path.splitext(media_files[0][0])[1].lower()
+            if _media_ext in (_IMAGE_EXTS | _VIDEO_EXTS) and not force_document:
+                caption_for_single_media = formatted[:1024]
+                send_text_separately = False
 
-        if formatted.strip():
+        if send_text_separately and formatted.strip():
             # Chunk *after* formatting: MarkdownV2/HTML escaping inflates the
             # text (each escaped char like `!`/`.`/`-` becomes `\!`/`\.`/`\-`),
             # so a message that fit under 4096 UTF-16 units raw can exceed the
@@ -1176,6 +1244,8 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             try:
                 with open(media_path, "rb") as f:
                     media_kwargs = dict(thread_kwargs)
+                    if caption_for_single_media and ext in (_IMAGE_EXTS | _VIDEO_EXTS):
+                        media_kwargs.update(caption=caption_for_single_media, parse_mode=send_parse_mode)
                     try:
                         if ext in _IMAGE_EXTS and not force_document:
                             last_msg = await bot.send_photo(

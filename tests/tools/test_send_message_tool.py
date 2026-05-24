@@ -29,6 +29,7 @@ from gateway.config import Platform
 from tools.send_message_tool import (
     _is_telegram_thread_not_found,
     _parse_target_ref,
+    _telegram_direct_messages_topic_id,
     _send_matrix_via_adapter,
     _send_signal,
     _send_telegram,
@@ -190,13 +191,35 @@ def _make_config():
 
 def _install_telegram_mock(monkeypatch, bot):
     parse_mode = SimpleNamespace(MARKDOWN_V2="MarkdownV2", HTML="HTML")
-    constants_mod = SimpleNamespace(ParseMode=parse_mode)
+    chat_type = SimpleNamespace(
+        GROUP="group",
+        SUPERGROUP="supergroup",
+        CHANNEL="channel",
+        PRIVATE="private",
+    )
+    constants_mod = SimpleNamespace(ParseMode=parse_mode, ChatType=chat_type)
     # MessageEntity needed by #27865 mention-detection path; tests don't
     # inspect it but the import must succeed.
     _MessageEntity = lambda **_kw: SimpleNamespace(**_kw)
-    telegram_mod = SimpleNamespace(Bot=lambda token: bot, MessageEntity=_MessageEntity, constants=constants_mod)
+    telegram_mod = SimpleNamespace(
+        Bot=lambda token: bot,
+        MessageEntity=_MessageEntity,
+        constants=constants_mod,
+    )
+    ext_mod = SimpleNamespace(
+        Application=object,
+        CommandHandler=object,
+        CallbackQueryHandler=object,
+        MessageHandler=object,
+        TypeHandler=object,
+        ContextTypes=SimpleNamespace(DEFAULT_TYPE=object),
+        filters=object,
+    )
+    request_mod = SimpleNamespace(HTTPXRequest=object)
     monkeypatch.setitem(sys.modules, "telegram", telegram_mod)
     monkeypatch.setitem(sys.modules, "telegram.constants", constants_mod)
+    monkeypatch.setitem(sys.modules, "telegram.ext", ext_mod)
+    monkeypatch.setitem(sys.modules, "telegram.request", request_mod)
 
 
 def _ensure_slack_mock(monkeypatch):
@@ -516,6 +539,112 @@ class TestSendMessageTool:
             force_document=False,
         )
 
+    def test_plugin_media_tag_is_sent_as_document(self, tmp_path, monkeypatch):
+        config, telegram_cfg = _make_config()
+        plugin_file = tmp_path / "voice-to-text.plugin"
+        plugin_file.write_text("# plugin")
+        monkeypatch.setattr(
+            "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS",
+            (tmp_path,),
+        )
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "telegram:12345",
+                        "message": f"MEDIA:{plugin_file}",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.TELEGRAM,
+            telegram_cfg,
+            "12345",
+            "",
+            thread_id=None,
+            media_files=[(str(plugin_file.resolve()), False)],
+            force_document=False,
+        )
+
+    def test_home_telegram_send_uses_current_session_thread(self):
+        home = SimpleNamespace(chat_id="-1001")
+        config, telegram_cfg = _make_config()
+        config.get_home_channel = lambda _platform: home
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("gateway.session_context.get_session_env") as get_session_env_mock, \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            get_session_env_mock.side_effect = lambda name, default="": {
+                "HERMES_SESSION_THREAD_ID": "17585",
+                "HERMES_SESSION_PLATFORM": "telegram",
+            }.get(name, default)
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "telegram",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.TELEGRAM,
+            telegram_cfg,
+            "-1001",
+            "hello",
+            thread_id="17585",
+            media_files=[],
+            force_document=False,
+        )
+
+    def test_private_telegram_topic_send_uses_direct_messages_topic_id(self):
+        config, telegram_cfg = _make_config()
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "telegram:12345:361231",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            Platform.TELEGRAM,
+            telegram_cfg,
+            "12345",
+            "hello",
+            thread_id="361231",
+            media_files=[],
+            force_document=False,
+            direct_messages_topic_id="361231",
+        )
+
+    def test_telegram_direct_messages_topic_id_only_for_private_chats(self):
+        assert _telegram_direct_messages_topic_id("12345", "361231") == "361231"
+        assert _telegram_direct_messages_topic_id("-1001", "17585") is None
+        assert _telegram_direct_messages_topic_id("12345", "1") is None
+
     def test_top_level_send_failure_redacts_query_token(self):
         config, _telegram_cfg = _make_config()
         leaked = "very-secret-query-token-123456"
@@ -545,7 +674,7 @@ class TestSendMessageTool:
 
 
 class TestSendTelegramMediaDelivery:
-    def test_sends_text_then_photo_for_media_tag(self, tmp_path, monkeypatch):
+    def test_sends_single_photo_with_caption_for_media_tag(self, tmp_path, monkeypatch):
         image_path = tmp_path / "photo.png"
         image_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
 
@@ -569,11 +698,36 @@ class TestSendTelegramMediaDelivery:
 
         assert result["success"] is True
         assert result["message_id"] == "2"
-        bot.send_message.assert_awaited_once()
+        bot.send_message.assert_not_awaited()
         bot.send_photo.assert_awaited_once()
-        sent_text = bot.send_message.await_args.kwargs["text"]
-        assert "MEDIA:" not in sent_text
-        assert sent_text == "Hello there"
+        photo_kwargs = bot.send_photo.await_args.kwargs
+        assert photo_kwargs["caption"] == "Hello there"
+        assert "MEDIA:" not in photo_kwargs["caption"]
+
+    def test_private_topic_uses_direct_messages_topic_id_not_message_thread(self, monkeypatch):
+        bot = MagicMock()
+        bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=1))
+        bot.send_photo = AsyncMock()
+        bot.send_video = AsyncMock()
+        bot.send_voice = AsyncMock()
+        bot.send_audio = AsyncMock()
+        bot.send_document = AsyncMock()
+        _install_telegram_mock(monkeypatch, bot)
+
+        result = asyncio.run(
+            _send_telegram(
+                "token",
+                "12345",
+                "Hello there",
+                thread_id="361231",
+                direct_messages_topic_id="361231",
+            )
+        )
+
+        assert result["success"] is True
+        kwargs = bot.send_message.await_args.kwargs
+        assert kwargs["direct_messages_topic_id"] == 361231
+        assert "message_thread_id" not in kwargs
 
     def test_sends_voice_for_ogg_with_voice_directive(self, tmp_path, monkeypatch):
         voice_path = tmp_path / "voice.ogg"
