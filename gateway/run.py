@@ -3681,6 +3681,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return None
 
+    def _parse_telegram_guest_mode_reasoning_config(
+        self,
+        user_config: Optional[dict],
+    ) -> Optional[dict]:
+        """Return telegram guest-mode reasoning config, if present."""
+        from hermes_constants import parse_reasoning_effort
+
+        telegram_cfg = (user_config or {}).get("telegram") or {}
+        if not isinstance(telegram_cfg, dict):
+            return None
+
+        raw = (
+            telegram_cfg.get("guest_mode_reasoning_effort")
+            or telegram_cfg.get("guest_reasoning_effort")
+            or telegram_cfg.get("guest_reasoning")
+        )
+        guest_model = telegram_cfg.get("guest_mode_model") or telegram_cfg.get("guest_model")
+        if raw in (None, "") and isinstance(guest_model, dict):
+            raw = guest_model.get("reasoning_effort") or guest_model.get("reasoning")
+        if raw in (None, ""):
+            return None
+
+        effort = str(raw).strip()
+        result = parse_reasoning_effort(effort)
+        if effort and result is None:
+            logger.warning("Unknown telegram guest-mode reasoning_effort '%s', using default", effort)
+        return result
+
     def _apply_telegram_guest_mode_model_override(
         self,
         *,
@@ -4671,8 +4699,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         *,
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
+        user_config: Optional[dict] = None,
+        guest_mode_invocation: bool = False,
     ) -> dict | None:
-        """Resolve reasoning effort for a session, honoring session overrides."""
+        """Resolve reasoning effort, honoring session and Telegram guest overrides."""
         resolved_session_key = session_key
         if not resolved_session_key and source is not None:
             try:
@@ -4683,6 +4713,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         overrides = getattr(self, "_session_reasoning_overrides", {}) or {}
         if resolved_session_key and resolved_session_key in overrides:
             return overrides[resolved_session_key]
+        if guest_mode_invocation:
+            guest_reasoning = self._parse_telegram_guest_mode_reasoning_config(user_config)
+            if guest_reasoning is not None:
+                return guest_reasoning
         return self._load_reasoning_config()
 
     def _load_persisted_session_runtime_overrides(self) -> None:
@@ -11277,7 +11311,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _footer_line = ""
             try:
                 from gateway.runtime_footer import build_footer_line as _bfl
-                _reasoning_cfg = self._resolve_session_reasoning_config(source=source)
+                _footer_cfg = _load_gateway_config()
+                _reasoning_cfg = self._resolve_session_reasoning_config(
+                    source=source,
+                    user_config=_footer_cfg,
+                    guest_mode_invocation=_is_telegram_guest_source(source),
+                )
                 if _reasoning_cfg is None:
                     _reasoning_effort = "medium"
                 elif _reasoning_cfg.get("enabled") is False:
@@ -11285,7 +11324,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     _reasoning_effort = str(_reasoning_cfg.get("effort") or "medium")
                 _footer_line = _bfl(
-                    user_config=_load_gateway_config(),
+                    user_config=_footer_cfg,
                     platform_key=_platform_config_key(source.platform),
                     model=agent_result.get("model"),
                     context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
@@ -17053,6 +17092,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reasoning_config = self._resolve_session_reasoning_config(
                 source=source,
                 session_key=session_key,
+                user_config=user_config,
+                guest_mode_invocation=guest_mode_invocation,
             )
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
