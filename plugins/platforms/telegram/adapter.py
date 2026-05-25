@@ -6561,6 +6561,22 @@ class TelegramAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("TELEGRAM_GUEST_MODE", "false").lower() in {"true", "1", "yes", "on"}
 
+    def _telegram_guest_mode_private_context(self) -> bool:
+        """Return whether Guest Mode may use owner-private memory/tools.
+
+        Default stays conservative because guest replies are public one-bubble
+        interactions. Operators can opt in when guest calls are already gated
+        by allow_from / TELEGRAM_ALLOWED_USERS.
+        """
+        configured = self.config.extra.get("guest_mode_private_context")
+        if configured is None:
+            configured = self.config.extra.get("guest_private_context")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.lower() in {"true", "1", "yes", "on"}
+            return bool(configured)
+        return os.getenv("TELEGRAM_GUEST_MODE_PRIVATE_CONTEXT", "false").lower() in {"true", "1", "yes", "on"}
+
     def _telegram_exclusive_bot_mentions(self) -> bool:
         """Return whether explicit @...bot mentions exclusively route group messages."""
         configured = self.config.extra.get("exclusive_bot_mentions")
@@ -7531,6 +7547,14 @@ class TelegramAdapter(BasePlatformAdapter):
     def _guest_context_card(self, guest_context: TelegramGuestContext) -> str:
         caller = guest_context.caller_user_name or guest_context.caller_user_id or "unknown caller"
         chat = guest_context.caller_chat_name or guest_context.caller_chat_id or "an opaque Telegram chat"
+        private_context = self._telegram_guest_mode_private_context()
+        privacy_policy = (
+            "- Owner-private context is enabled for this deployment: guest calls are already gated by the configured Telegram allowed-user list. "
+            "You may use available private memory, session_search, skills, files, and tools when they are needed to answer the authorized caller accurately. "
+            "For personal entities (for example pets, close people, projects, or past discussions), look up context before saying you do not know.\n"
+            if private_context
+            else "- Guest-safe policy: do not expose private owner memory or personal data unless it is already in the visible context.\n"
+        )
         return (
             "[Telegram Guest Mode]\n"
             f"- Caller: {caller}\n"
@@ -7539,7 +7563,7 @@ class TelegramAdapter(BasePlatformAdapter):
             "You do not have full chat history; you can only rely on the summoned message, "
             "one replied-to message, and any media/text explicitly provided here.\n"
             "- Keep the public answer short and self-contained. Do not claim you can see the group beyond the visible guest context.\n"
-            "- Guest-safe policy: do not expose private owner memory or personal data unless it is already in the visible context.\n"
+            f"{privacy_policy}"
             "- For current facts, prices, event tickets, schedules, news, or anything the user asks you to look up, "
             "use web_search first. Use web_extract only after web_search returns specific result URLs, or when the user "
             "gives you a direct URL. Do not use web_extract on Google/DuckDuckGo/search-result URLs as a substitute for web_search.\n"
