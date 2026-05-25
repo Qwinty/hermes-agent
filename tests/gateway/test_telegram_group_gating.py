@@ -20,6 +20,7 @@ def _make_adapter(
     allowed_chats=None,
     group_allowed_chats=None,
     guest_mode=None,
+    guest_mode_private_context=None,
     observe_unmentioned_group_messages=None,
     bot_username="hermes_bot",
 ):
@@ -60,6 +61,8 @@ def _make_adapter(
         extra["group_allowed_chats"] = []
     if guest_mode is not None:
         extra["guest_mode"] = guest_mode
+    if guest_mode_private_context is not None:
+        extra["guest_mode_private_context"] = guest_mode_private_context
     if observe_unmentioned_group_messages is not None:
         extra["observe_unmentioned_group_messages"] = observe_unmentioned_group_messages
 
@@ -1390,6 +1393,48 @@ def test_raw_guest_update_routes_via_guest_query_id_and_caller_user():
     assert event.session_key_override.startswith("telegram:guest-session:-100123:message:122:")
     assert "[Telegram Guest Mode]" in event.channel_prompt
     assert "DM fallback" in event.channel_prompt
+
+
+def test_guest_context_private_context_prompt_when_enabled():
+    from gateway.platforms.telegram import TelegramGuestContext
+
+    adapter = _make_adapter(guest_mode=True, guest_mode_private_context=True)
+    ctx = TelegramGuestContext(
+        guest_query_id="guest-query-1",
+        message=SimpleNamespace(),
+        api_kwargs={},
+        caller_user_name="Maxim",
+        caller_user_id="273403055",
+        caller_chat_name="Guest Chat",
+        caller_chat_id="-100123",
+    )
+
+    prompt = adapter._guest_context_card(ctx)
+
+    assert "Owner-private context is enabled" in prompt
+    assert "session_search" in prompt
+    assert "look up context before saying you do not know" in prompt
+    assert "do not expose private owner memory" not in prompt
+
+
+def test_guest_context_default_keeps_private_context_restricted():
+    from gateway.platforms.telegram import TelegramGuestContext
+
+    adapter = _make_adapter(guest_mode=True)
+    ctx = TelegramGuestContext(
+        guest_query_id="guest-query-1",
+        message=SimpleNamespace(),
+        api_kwargs={},
+        caller_user_name="Maxim",
+        caller_user_id="273403055",
+        caller_chat_name="Guest Chat",
+        caller_chat_id="-100123",
+    )
+
+    prompt = adapter._guest_context_card(ctx)
+
+    assert "Guest-safe policy" in prompt
+    assert "do not expose private owner memory" in prompt
 
 
 def test_raw_guest_reply_chain_reuses_session_key_override():
