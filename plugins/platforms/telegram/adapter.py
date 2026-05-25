@@ -1135,6 +1135,11 @@ class TelegramAdapter(BasePlatformAdapter):
         message_id = getattr(response, "message_id", None) or getattr(response, "id", None)
         return str(message_id) if message_id is not None else None
 
+    @staticmethod
+    def _is_guest_inline_message_invalid_error(error: Any) -> bool:
+        text = str(error or "").lower()
+        return "message_id_invalid" in text or "message to edit not found" in text
+
     async def _raw_bot_api_post(self, method: str, data: Dict[str, Any]) -> Any:
         """Call a Bot API method that PTB may not expose yet.
 
@@ -3815,6 +3820,8 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception as fmt_exc:
                 if not finalize:
                     raise
+                if self._is_guest_inline_message_invalid_error(fmt_exc):
+                    raise
                 if "not modified" in str(fmt_exc).lower():
                     return SendResult(success=True, message_id=inline_message_id)
                 # MarkdownV2 formatting is best-effort; fall back to raw text
@@ -3854,11 +3861,23 @@ class TelegramAdapter(BasePlatformAdapter):
         if guest_query_id:
             inline_message_id = self._guest_inline_message_ids_cache().get(guest_query_id)
             if inline_message_id:
-                return await self._edit_guest_inline_message(
+                edit_result = await self._edit_guest_inline_message(
                     inline_message_id,
                     content,
                     finalize=True,
                 )
+                if edit_result.success:
+                    return edit_result
+                if self._is_guest_inline_message_invalid_error(edit_result.error):
+                    logger.warning(
+                        "[%s] Guest inline message %s is no longer editable; "
+                        "retrying guest query answer",
+                        self.name,
+                        inline_message_id,
+                    )
+                    self._guest_inline_message_ids_cache().pop(guest_query_id, None)
+                    return await self._answer_guest_query(guest_query_id, content)
+                return edit_result
             return await self._answer_guest_query(guest_query_id, content)
         
         try:
