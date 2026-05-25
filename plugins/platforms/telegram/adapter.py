@@ -7935,10 +7935,13 @@ class TelegramAdapter(BasePlatformAdapter):
             "- You are answering through a Telegram Guest Bot one-shot reply. "
             "You do not have full chat history; you can only rely on the summoned message, "
             "one replied-to message, and any media/text explicitly provided here.\n"
-            "- Keep the public answer short and self-contained. Do not claim you can see or search the group.\n"
+            "- Keep the public answer short and self-contained. Do not claim you can see the group beyond the visible guest context.\n"
             "- Guest-safe policy: do not expose private owner memory or personal data unless it is already in the visible context.\n"
-            "- DM fallback: if the request needs tools, web/file/system access, multiple steps, or a long-running task, "
-            "do not pretend it is done. Briefly ask the caller to open the bot in a private chat (/start) and repeat the request there."
+            "- For current facts, prices, event tickets, schedules, news, or anything the user asks you to look up, "
+            "use web_search first. Use web_extract only after web_search returns specific result URLs, or when the user "
+            "gives you a direct URL. Do not use web_extract on Google/DuckDuckGo/search-result URLs as a substitute for web_search.\n"
+            "- DM fallback: if the request needs private files, terminal/system access, many steps, or a long-running task, "
+            "briefly ask the caller to open the bot in a private chat (/start) and repeat the request there."
         )
 
     @classmethod
