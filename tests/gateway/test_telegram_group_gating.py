@@ -1610,6 +1610,30 @@ def test_guest_chat_second_send_edits_existing_inline_message():
     assert second_call.kwargs["data"]["text"] == "готовый ответ"
 
 
+def test_guest_chat_invalid_cached_inline_id_retries_guest_query_answer():
+    adapter = _make_adapter(guest_mode=True)
+
+    async def fake_post(method, *, data):
+        if method == "editMessageText":
+            raise Exception("Message_id_invalid")
+        return {"inline_message_id": "inline-99"}
+
+    adapter._bot = SimpleNamespace(_post=AsyncMock(side_effect=fake_post))
+
+    first = asyncio.run(adapter.send("guest:guest-query-1", "Думаю…"))
+    second = asyncio.run(adapter.send("guest:guest-query-1", "готовый ответ"))
+
+    assert first.success is True
+    assert second.success is True
+    assert second.message_id == "inline-99"
+    assert adapter._bot._post.await_count == 3
+    first_call, second_call, third_call = adapter._bot._post.await_args_list
+    assert first_call.args[0] == "answerGuestQuery"
+    assert second_call.args[0] == "editMessageText"
+    assert third_call.args[0] == "answerGuestQuery"
+    assert third_call.kwargs["data"]["guest_query_id"] == "guest-query-1"
+
+
 def test_guest_edit_message_uses_inline_message_id():
     adapter = _make_adapter(guest_mode=True)
     adapter._bot = SimpleNamespace(_post=AsyncMock(return_value=True))
