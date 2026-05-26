@@ -3983,8 +3983,8 @@ class GatewaySlashCommandsMixin:
                 ]
                 approx = estimate_messages_tokens_rough(msgs)
                 return (
-                    "Context composition\n"
-                    f"Estimated messages: {approx:,} tokens\n"
+                    "🧠 Context Window\n"
+                    f"Estimated messages: {approx:,} tok\n"
                     f"Messages: {len(msgs)}\n"
                     "Detailed system/tool breakdown is available after the first agent turn."
                 )
@@ -3994,7 +3994,7 @@ class GatewaySlashCommandsMixin:
             from agent.context_report import build_context_report, format_context_report
 
             report = build_context_report(agent, messages)
-            return format_context_report(report)
+            return format_context_report(report, compact=True)
         except Exception as exc:
             logger.warning("Context command failed: %s", exc)
             return f"Context report failed: {exc}"
