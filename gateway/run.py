@@ -3931,9 +3931,11 @@ class GatewayRunner:
         now = datetime.now()
         scheduled = 0
         for entry in candidates:
+            effective_session_id = self._effective_resume_session_id(entry)
+            entry_session_id = str(getattr(entry, "session_id", "") or "")
             history = None
             try:
-                history = self.session_store.load_transcript(entry.session_id)
+                history = self.session_store.load_transcript(effective_session_id)
                 if not isinstance(history, list):
                     history = None
             except Exception as exc:
@@ -3947,6 +3949,25 @@ class GatewayRunner:
                 logger.info(
                     "Skipping auto-resume for %s: transcript already ends with assistant response; clearing stale resume_pending",
                     entry.session_key,
+                )
+                try:
+                    self.session_store.clear_resume_pending(entry.session_key)
+                except Exception as exc:
+                    logger.debug(
+                        "clear stale resume_pending failed for %s: %s",
+                        entry.session_key,
+                        exc,
+                    )
+                continue
+
+            if (
+                effective_session_id != entry_session_id
+                and not self._has_resume_transcript(effective_session_id)
+            ):
+                logger.info(
+                    "Skipping auto-resume for %s: no transcript messages in %s",
+                    entry.session_key,
+                    effective_session_id or "<unknown>",
                 )
                 try:
                     self.session_store.clear_resume_pending(entry.session_key)
@@ -4016,6 +4037,47 @@ class GatewayRunner:
                 scheduled,
             )
         return scheduled
+
+    def _effective_resume_session_id(self, entry) -> str:
+        """Return the transcript session id an auto-resume would actually use."""
+        session_id = str(getattr(entry, "session_id", "") or "")
+        source = getattr(entry, "origin", None)
+        session_db = getattr(self, "_session_db", None)
+        if (
+            source is not None
+            and session_db is not None
+            and getattr(source, "platform", None) == Platform.TELEGRAM
+            and getattr(source, "chat_type", None) == "dm"
+            and getattr(source, "chat_id", None)
+            and getattr(source, "thread_id", None)
+        ):
+            try:
+                binding = session_db.get_telegram_topic_binding(
+                    chat_id=str(source.chat_id),
+                    thread_id=str(source.thread_id),
+                )
+                bound_session_id = str((binding or {}).get("session_id") or "")
+                if bound_session_id:
+                    return bound_session_id
+            except Exception:
+                logger.debug("Failed to resolve Telegram topic resume binding", exc_info=True)
+        return session_id
+
+    def _has_resume_transcript(self, session_id: str) -> bool:
+        """True when there is persisted conversation state worth auto-resuming."""
+        if not session_id:
+            return False
+        session_db = getattr(self, "_session_db", None)
+        if session_db is None:
+            return True
+        try:
+            return bool(session_db.message_count(session_id))
+        except Exception:
+            logger.debug(
+                "Could not count transcript messages for startup auto-resume",
+                exc_info=True,
+            )
+            return True
 
     async def start(self) -> bool:
         """
@@ -8314,6 +8376,9 @@ class GatewayRunner:
             if binding:
                 bound_session_id = str(binding.get("session_id") or "")
                 if bound_session_id and bound_session_id != session_entry.session_id:
+                    resume_pending = bool(getattr(session_entry, "resume_pending", False))
+                    resume_reason = getattr(session_entry, "resume_reason", None)
+                    last_resume_marked_at = getattr(session_entry, "last_resume_marked_at", None)
                     # Route the override through SessionStore so the session_key
                     # → session_id mapping is persisted to disk and the previous
                     # lane session is ended cleanly. Mutating session_entry in
@@ -8321,6 +8386,17 @@ class GatewayRunner:
                     # index pointed at one id but code downstream used another.
                     switched = self.session_store.switch_session(session_key, bound_session_id)
                     if switched is not None:
+                        if resume_pending:
+                            switched.resume_pending = True
+                            switched.resume_reason = resume_reason
+                            switched.last_resume_marked_at = last_resume_marked_at
+                            try:
+                                self.session_store._save()
+                            except Exception:
+                                logger.debug(
+                                    "Failed to preserve resume_pending after Telegram topic switch",
+                                    exc_info=True,
+                                )
                         session_entry = switched
             else:
                 try:

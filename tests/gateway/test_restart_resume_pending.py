@@ -1151,6 +1151,86 @@ async def test_startup_auto_resume_skips_when_adapter_unavailable():
     adapter.handle_message.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_startup_auto_resume_skips_empty_bound_dm_topic_transcript():
+    """Do not synthesize a blank turn for a stale Telegram DM-topic binding."""
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(
+        chat_id="topic-chat",
+        chat_type="dm",
+        thread_id="topic-1",
+    )
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:dm:topic-chat:topic-1",
+        session_id="fresh-empty-session",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    runner.session_store.clear_resume_pending = MagicMock(return_value=True)
+    runner._session_db = MagicMock()
+    runner._session_db.get_telegram_topic_binding.return_value = {
+        "session_id": "bound-empty-session",
+    }
+    runner._session_db.message_count.return_value = 0
+    adapter.handle_message = AsyncMock()
+
+    scheduled = runner._schedule_resume_pending_sessions()
+
+    assert scheduled == 0
+    adapter.handle_message.assert_not_called()
+    runner.session_store.load_transcript.assert_called_once_with(
+        "bound-empty-session"
+    )
+    runner._session_db.message_count.assert_called_once_with("bound-empty-session")
+    runner.session_store.clear_resume_pending.assert_called_once_with(
+        pending_entry.session_key
+    )
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_uses_bound_dm_topic_transcript_when_present():
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(
+        chat_id="topic-chat",
+        chat_type="dm",
+        thread_id="topic-1",
+    )
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:dm:topic-chat:topic-1",
+        session_id="fresh-session",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    runner._session_db = MagicMock()
+    runner._session_db.get_telegram_topic_binding.return_value = {
+        "session_id": "bound-session",
+    }
+    runner._session_db.message_count.return_value = 3
+    adapter.handle_message = AsyncMock()
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    runner.session_store.load_transcript.assert_called_once_with("bound-session")
+    runner._session_db.message_count.assert_called_once_with("bound-session")
+    adapter.handle_message.assert_awaited_once()
+
+
 # ---------------------------------------------------------------------------
 # Shutdown banner wording
 # ---------------------------------------------------------------------------
