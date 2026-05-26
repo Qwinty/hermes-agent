@@ -116,6 +116,7 @@ EXHAUSTED_TTL_401_SECONDS = 5 * 60           # 5 minutes
 EXHAUSTED_TTL_429_SECONDS = 60 * 60          # 1 hour
 EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60      # 1 hour
 CODEX_USAGE_LIMIT_RECONCILE_GRACE_SECONDS = 5 * 60
+CODEX_USAGE_PROBE_TIMEOUT_SECONDS = 2.0
 
 # Pool key prefix for custom OpenAI-compatible endpoints.
 # Custom endpoints all share provider='custom' but are keyed by their
@@ -345,6 +346,21 @@ def _codex_usage_url_for_entry(entry: PooledCredential) -> str:
     return base_url + "/api/codex/usage"
 
 
+def _codex_usage_probe_timeout_seconds() -> float:
+    # Live usage checks can run from pool selection while the provider lock is
+    # held. The probe is opportunistic, so cap even env-provided values to keep
+    # slow Codex usage endpoints from stalling unrelated pool operations.
+    raw = os.getenv("HERMES_CODEX_USAGE_TIMEOUT_SECONDS", "")
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = CODEX_USAGE_PROBE_TIMEOUT_SECONDS
+    else:
+        value = CODEX_USAGE_PROBE_TIMEOUT_SECONDS
+    return max(0.1, min(value, CODEX_USAGE_PROBE_TIMEOUT_SECONDS))
+
+
 def _codex_account_id_from_token(access_token: str) -> Optional[str]:
     claims = _decode_jwt_claims(access_token)
     auth_claims = claims.get("https://api.openai.com/auth")
@@ -402,7 +418,7 @@ def _fetch_codex_entry_usage_status(entry: PooledCredential) -> Optional[_CodexU
     if account_id:
         headers["ChatGPT-Account-ID"] = account_id
 
-    timeout = float(os.getenv("HERMES_CODEX_USAGE_TIMEOUT_SECONDS", "8") or "8")
+    timeout = _codex_usage_probe_timeout_seconds()
     request = urllib.request.Request(_codex_usage_url_for_entry(entry), headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
