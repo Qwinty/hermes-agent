@@ -4188,6 +4188,9 @@ class TestCredentialPoolRecovery:
         captured = {}
 
         class _Pool:
+            def current(self):
+                return SimpleNamespace(last_status=None)
+
             def mark_exhausted_and_rotate(self, **kwargs):
                 captured.update(kwargs)
                 return next_entry
