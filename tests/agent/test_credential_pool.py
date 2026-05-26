@@ -35,6 +35,48 @@ def _codex_jwt(account_id: str, sub: str = "user") -> str:
     )
 
 
+def test_codex_usage_probe_timeout_is_capped(monkeypatch):
+    from agent.credential_pool import PooledCredential, _fetch_codex_entry_usage_status
+
+    seen = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"rate_limit":{"allowed":true}}'
+
+    def fake_urlopen(_request, *, timeout):
+        seen["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setenv("HERMES_CODEX_USAGE_TIMEOUT_SECONDS", "8")
+    monkeypatch.setattr(
+        "agent.credential_pool.urllib.request.urlopen",
+        fake_urlopen,
+    )
+
+    entry = PooledCredential(
+        provider="openai-codex",
+        id="cred-1",
+        label="codex",
+        auth_type="oauth",
+        priority=0,
+        source="manual:device_code",
+        access_token=_codex_jwt("acct", "user"),
+    )
+
+    status = _fetch_codex_entry_usage_status(entry)
+
+    assert status is not None
+    assert status.available is True
+    assert seen["timeout"] == 2.0
+
+
 def test_fill_first_selection_skips_recently_exhausted_entry(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     _write_auth_store(
