@@ -441,6 +441,52 @@ def test_codex_usage_reconcile_keeps_future_usage_limit_reset_despite_live_avail
     assert entry.last_error_reset_at == future_reset
 
 
+def test_codex_usage_reconcile_clears_future_reset_when_usage_allowed_true(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    future_reset = time.time() + 3600
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-1",
+                        "label": "allowed-again",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": _jwt_with_claims({"sub": "one"}),
+                        "refresh_token": "refresh-1",
+                        "last_status": "exhausted",
+                        "last_status_at": time.time() - 600,
+                        "last_error_code": 429,
+                        "last_error_reason": "usage_limit_reached",
+                        "last_error_message": "The usage limit has been reached",
+                        "last_error_reset_at": future_reset,
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import _CodexUsageStatus, load_pool
+
+    monkeypatch.setattr(
+        "agent.credential_pool._fetch_codex_entry_usage_status",
+        lambda _entry: _CodexUsageStatus(available=True, allowed=True),
+    )
+
+    pool = load_pool("openai-codex")
+    selected = pool.select()
+
+    assert selected is not None
+    assert selected.id == "cred-1"
+    [entry] = pool.entries()
+    assert entry.last_status == "ok"
+    assert entry.last_error_reset_at is None
+
+
 def test_codex_usage_reconcile_clears_elapsed_usage_limit_reset(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     elapsed_reset = time.time() - 60
