@@ -332,6 +332,10 @@ export interface SessionUsageResponse {
   total?: number
 }
 
+export interface SessionContextResponse {
+  output?: string
+}
+
 export interface SessionStatusResponse {
   output?: string
 }
