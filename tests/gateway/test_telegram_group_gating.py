@@ -1636,6 +1636,46 @@ def test_send_guest_chat_uses_answer_guest_query():
     payload = json.loads(data["result"])
     assert payload["type"] == "article"
     assert payload["input_message_content"]["message_text"] == "hello from Hermes"
+    assert payload["input_message_content"]["parse_mode"] == "MarkdownV2"
+
+
+def test_guest_chat_initial_answer_formats_markdown():
+    adapter = _make_adapter(guest_mode=True)
+    adapter._bot = SimpleNamespace(_post=AsyncMock(return_value={"inline_message_id": "inline-42"}))
+
+    result = asyncio.run(adapter.send("guest:guest-query-1", "**Жирный** текст"))
+
+    assert result.success is True
+    endpoint = adapter._bot._post.await_args.args[0]
+    data = adapter._bot._post.await_args.kwargs["data"]
+    assert endpoint == "answerGuestQuery"
+    payload = json.loads(data["result"])
+    assert payload["input_message_content"]["message_text"] == "*Жирный* текст"
+    assert payload["input_message_content"]["parse_mode"] == "MarkdownV2"
+
+
+def test_guest_chat_initial_answer_falls_back_to_plain_text_on_markdown_parse_error():
+    adapter = _make_adapter(guest_mode=True)
+
+    async def fake_post(method, *, data):
+        payload = json.loads(data["result"])
+        if payload["input_message_content"].get("parse_mode") == "MarkdownV2":
+            raise Exception("Can't parse entities")
+        return {"inline_message_id": "inline-42"}
+
+    adapter._bot = SimpleNamespace(_post=AsyncMock(side_effect=fake_post))
+
+    result = asyncio.run(adapter.send("guest:guest-query-1", "**Жирный** текст"))
+
+    assert result.success is True
+    assert adapter._bot._post.await_count == 2
+    first_call, second_call = adapter._bot._post.await_args_list
+    first_payload = json.loads(first_call.kwargs["data"]["result"])
+    second_payload = json.loads(second_call.kwargs["data"]["result"])
+    assert first_payload["input_message_content"]["parse_mode"] == "MarkdownV2"
+    assert first_payload["input_message_content"]["message_text"] == "*Жирный* текст"
+    assert "parse_mode" not in second_payload["input_message_content"]
+    assert second_payload["input_message_content"]["message_text"] == "**Жирный** текст"
 
 
 def test_guest_chat_second_send_edits_existing_inline_message():
