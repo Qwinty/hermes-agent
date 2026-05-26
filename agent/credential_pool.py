@@ -334,6 +334,7 @@ class _CodexUsageStatus:
     reset_at: Optional[float] = None
     reason: Optional[str] = None
     message: Optional[str] = None
+    allowed: Optional[bool] = None
 
 
 def _codex_usage_url_for_entry(entry: PooledCredential) -> str:
@@ -441,13 +442,14 @@ def _fetch_codex_entry_usage_status(entry: PooledCredential) -> Optional[_CodexU
     allowed = rate_limit.get("allowed")
     limit_reached = rate_limit.get("limit_reached")
     if allowed is True:
-        return _CodexUsageStatus(available=True, reset_at=reset_at)
+        return _CodexUsageStatus(available=True, reset_at=reset_at, allowed=True)
     if limit_reached is True or allowed is False:
         return _CodexUsageStatus(
             available=False,
             reset_at=reset_at,
             reason="usage_limit_reached",
             message="The usage limit has been reached",
+            allowed=False,
         )
 
     used_values: list[float] = []
@@ -1899,21 +1901,6 @@ class CredentialPool:
             ]
             if not exhausted_entries:
                 continue
-            held_entry = next(
-                (
-                    candidate for candidate in exhausted_entries
-                    if _has_authoritative_future_usage_limit(candidate, now=now)
-                ),
-                None,
-            )
-            if held_entry is not None:
-                hold_until = _codex_usage_limit_hold_until(held_entry, now=now)
-                logger.debug(
-                    "credential pool: keeping Codex usage-limit cooldown for %s until %.0f",
-                    held_entry.label or held_entry.id[:8],
-                    hold_until or 0,
-                )
-                continue
             entry = exhausted_entries[0]
             if entry.last_status != STATUS_EXHAUSTED:
                 continue
@@ -1935,6 +1922,21 @@ class CredentialPool:
             if status is None:
                 continue
             if status.available:
+                held_entry = next(
+                    (
+                        candidate for candidate in exhausted_entries
+                        if _has_authoritative_future_usage_limit(candidate, now=now)
+                    ),
+                    None,
+                )
+                if held_entry is not None and status.allowed is not True:
+                    hold_until = _codex_usage_limit_hold_until(held_entry, now=now)
+                    logger.debug(
+                        "credential pool: keeping Codex usage-limit cooldown for %s until %.0f",
+                        held_entry.label or held_entry.id[:8],
+                        hold_until or 0,
+                    )
+                    continue
                 for candidate in account_entries:
                     if candidate.last_status != STATUS_EXHAUSTED:
                         continue
