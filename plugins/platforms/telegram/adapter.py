@@ -379,6 +379,18 @@ def _separate_chunk_indicator_from_fence(text: str) -> str:
     return _CHUNK_INDICATOR_ON_FENCE_RE.sub(r'```\n\g<indicator>', text)
 
 
+def _telegram_markdown_v2_parse_mode() -> str:
+    """Return a JSON-serializable MarkdownV2 parse_mode value.
+
+    Some unit tests import this module with a MagicMock-backed telegram
+    package, so ``getattr(ParseMode, "MARKDOWN_V2")`` can be a MagicMock.
+    Raw Bot API payloads are JSON-encoded before sending, so normalize that
+    case to Telegram's literal parse mode string.
+    """
+    value = getattr(ParseMode, "MARKDOWN_V2", "MarkdownV2")
+    return value if isinstance(value, str) else "MarkdownV2"
+
+
 # ---------------------------------------------------------------------------
 # Markdown table → Telegram-friendly row groups
 # ---------------------------------------------------------------------------
@@ -1156,16 +1168,25 @@ class TelegramAdapter(BasePlatformAdapter):
             raise RuntimeError("python-telegram-bot raw _post API is not available")
         return await post(method, data=data)
 
-    def _guest_article_result(self, guest_query_id: str, message_text: str) -> Dict[str, Any]:
+    def _guest_article_result(
+        self,
+        guest_query_id: str,
+        message_text: str,
+        *,
+        format_markdown: bool = True,
+    ) -> Dict[str, Any]:
         """Build the InlineQueryResultArticle payload for answerGuestQuery."""
+        input_message_content: Dict[str, Any] = {
+            "message_text": self.format_message(message_text) if format_markdown else message_text,
+            "disable_web_page_preview": self._disable_link_previews,
+        }
+        if format_markdown:
+            input_message_content["parse_mode"] = _telegram_markdown_v2_parse_mode()
         return {
             "type": "article",
             "id": f"hermes-{abs(hash((guest_query_id, message_text))) & 0xffffffff:x}",
             "title": "Hermes",
-            "input_message_content": {
-                "message_text": message_text,
-                "disable_web_page_preview": self._disable_link_previews,
-            },
+            "input_message_content": input_message_content,
         }
 
     async def _raw_answer_guest_query(self, guest_query_id: str, result: Dict[str, Any]) -> Any:
@@ -3780,7 +3801,19 @@ class TelegramAdapter(BasePlatformAdapter):
             chunks = self.truncate_message(content.strip(), self.MAX_MESSAGE_LENGTH, len_fn=utf16_len)
             message_text = chunks[0] if chunks else content.strip()
             result = self._guest_article_result(guest_query_id, message_text)
-            response = await self._raw_answer_guest_query(guest_query_id, result)
+            try:
+                response = await self._raw_answer_guest_query(guest_query_id, result)
+            except Exception as fmt_exc:
+                if not any(marker in str(fmt_exc).lower() for marker in ("parse", "markdown", "entities")):
+                    raise
+                # Keep guest delivery best-effort if Telegram rejects a
+                # MarkdownV2 edge case in the one-shot answerGuestQuery path.
+                fallback_result = self._guest_article_result(
+                    guest_query_id,
+                    message_text,
+                    format_markdown=False,
+                )
+                response = await self._raw_answer_guest_query(guest_query_id, fallback_result)
             inline_message_id = self._guest_inline_message_id_from_response(response)
             if inline_message_id:
                 self._guest_inline_message_ids_cache()[guest_query_id] = inline_message_id
