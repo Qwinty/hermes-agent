@@ -115,7 +115,6 @@ SUPPORTED_POOL_STRATEGIES = {
 EXHAUSTED_TTL_401_SECONDS = 5 * 60           # 5 minutes
 EXHAUSTED_TTL_429_SECONDS = 60 * 60          # 1 hour
 EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60      # 1 hour
-CODEX_USAGE_LIMIT_RECONCILE_GRACE_SECONDS = 5 * 60
 CODEX_USAGE_PROBE_TIMEOUT_SECONDS = 2.0
 
 # Pool key prefix for custom OpenAI-compatible endpoints.
@@ -469,16 +468,6 @@ def _fetch_codex_entry_usage_status(entry: PooledCredential) -> Optional[_CodexU
     return None
 
 
-def _codex_usage_limit_reconcile_grace_seconds() -> float:
-    raw = os.getenv("HERMES_CODEX_USAGE_LIMIT_RECONCILE_GRACE_SECONDS", "")
-    if not raw:
-        return float(CODEX_USAGE_LIMIT_RECONCILE_GRACE_SECONDS)
-    try:
-        return max(0.0, float(raw))
-    except (TypeError, ValueError):
-        return float(CODEX_USAGE_LIMIT_RECONCILE_GRACE_SECONDS)
-
-
 def _exhausted_until(entry: PooledCredential) -> Optional[float]:
     if entry.last_status != STATUS_EXHAUSTED:
         return None
@@ -526,8 +515,7 @@ def _codex_usage_limit_hold_until(
     status_at = _parse_absolute_timestamp(getattr(entry, "last_status_at", None))
     if status_at is None:
         return None
-    grace_until = status_at + _codex_usage_limit_reconcile_grace_seconds()
-    return min(reset_at, grace_until)
+    return reset_at
 
 
 def _has_authoritative_future_usage_limit(
@@ -535,12 +523,13 @@ def _has_authoritative_future_usage_limit(
     *,
     now: Optional[float] = None,
 ) -> bool:
-    """True while a fresh Codex usage-limit reset is in its reconcile hold.
+    """True while a Codex usage-limit reset is still authoritative.
 
     The Codex usage probe can lag or disagree with the Responses endpoint.  If
     the endpoint that just rejected the request gave us ``usage_limit_reached``,
-    keep that cooldown authoritative only for a short bounded grace period.
-    After that, live usage may clear stale future reset timestamps.
+    keep that cooldown authoritative until its reset timestamp elapses.  Live
+    usage can still clear stale/no-reset exhaustion, but it should not override
+    a concrete future reset returned by the failed model request.
     """
     now_value = now if now is not None else time.time()
     hold_until = _codex_usage_limit_hold_until(entry, now=now_value)
