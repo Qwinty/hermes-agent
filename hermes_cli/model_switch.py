@@ -1899,6 +1899,17 @@ def list_authenticated_providers(
             if not _cp_model_ids:
                 _cp_model_ids = curated.get(_cp.slug, [])
         _cp_total = len(_cp_model_ids)
+
+        # When a canonical provider has no curated models (e.g. commandcode,
+        # kiro — local proxy providers that the user configures via
+        # custom_providers), skip it here instead of emitting a 0-model row
+        # and recording its endpoint URL.  Section 4 (custom_providers) will
+        # surface the same provider with its real model list.  Without this
+        # skip, section 4's _builtin_endpoints dedup blocks the real row,
+        # leaving only the empty canonical row which is later filtered out.
+        if _cp_total == 0:
+            continue
+
         _cp_top = _cp_model_ids[:max_models] if max_models is not None else _cp_model_ids
 
         results.append({
