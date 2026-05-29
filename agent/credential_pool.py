@@ -2202,6 +2202,31 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
         except ImportError:
             pass
 
+        # API-key vs OAuth is a user-visible choice at `hermes setup`.
+        # When ANTHROPIC_API_KEY is set and OAuth env vars are absent, the
+        # user explicitly chose the API-key path and opted out of Claude Code /
+        # Hermes PKCE OAuth masquerade. Do not seed autodiscovered OAuth creds
+        # into the same pool, and prune stale autodiscovered entries left from
+        # a previous OAuth setup.
+        _env_file = load_env()
+
+        def _env_val(key: str) -> str:
+            return (_env_file.get(key) or os.environ.get(key) or "").strip()
+
+        anthropic_api_key = _env_val("ANTHROPIC_API_KEY")
+        anthropic_oauth_env = (
+            _env_val("ANTHROPIC_TOKEN") or _env_val("CLAUDE_CODE_OAUTH_TOKEN")
+        )
+        if anthropic_api_key and not anthropic_oauth_env:
+            retained = [
+                entry for entry in entries
+                if entry.source not in {"hermes_pkce", "claude_code"}
+            ]
+            if len(retained) != len(entries):
+                entries[:] = retained
+                changed = True
+            return changed, active_sources
+
         from agent.anthropic_adapter import read_claude_code_credentials, read_hermes_oauth_credentials
 
         for source_name, creds in (

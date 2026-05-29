@@ -3749,7 +3749,7 @@ def test_codex_manual_device_code_terminal_refresh_marks_entry_exhausted(
         },
     )
 
-    from agent.credential_pool import STATUS_EXHAUSTED, load_pool
+    from agent.credential_pool import STATUS_DEAD, load_pool
     import hermes_cli.auth as auth_mod
     from hermes_cli.auth import AuthError
 
@@ -3772,7 +3772,7 @@ def test_codex_manual_device_code_terminal_refresh_marks_entry_exhausted(
 
     [entry] = pool.entries()
     assert entry.id == "manual-device-code"
-    assert entry.last_status == STATUS_EXHAUSTED
+    assert entry.last_status == STATUS_DEAD
     assert entry.last_error_code == 401
     assert entry.last_error_reason == "token_invalidated"
 
@@ -3782,7 +3782,7 @@ def test_codex_manual_device_code_terminal_refresh_marks_entry_exhausted(
     auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
     [persisted] = auth_payload["credential_pool"]["openai-codex"]
     assert persisted["id"] == "manual-device-code"
-    assert persisted["last_status"] == STATUS_EXHAUSTED
+    assert persisted["last_status"] == STATUS_DEAD
     assert persisted["last_error_reason"] == "token_invalidated"
 
 
