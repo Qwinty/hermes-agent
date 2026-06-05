@@ -426,13 +426,16 @@ def decide_image_input_mode(
     if mode_cfg == "text":
         return "text"
 
-    # auto
-    if _explicit_aux_vision_override(cfg):
-        return "text"
-
+    # auto: prefer native vision when the active main model supports it.
+    # auxiliary.vision is a fallback for text-only models, not a blocker for
+    # models that can see pixels directly.
     supports = _lookup_supports_vision(provider, model, cfg)
     if supports is True:
         return "native"
+
+    if _explicit_aux_vision_override(cfg):
+        return "text"
+
     return "text"
 
 
