@@ -1110,6 +1110,47 @@ def test_named_custom_provider_uses_key_env_from_providers_dict(monkeypatch):
     assert resolved["model"] == "acme-large"
 
 
+def test_providers_dict_entry_uses_registered_provider_profile_when_key_matches(monkeypatch):
+    """A providers: entry whose key has a ProviderProfile should use that profile."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv("CLIPROXY_API_KEY", "cpa-secret")
+    monkeypatch.setattr(
+        rp,
+        "load_config",
+        lambda: {
+            "providers": {
+                "cliproxyapi": {
+                    "base_url": "http://127.0.0.1:8317/v1",
+                    "default_model": "gpt-5.5",
+                    "key_env": "CLIPROXY_API_KEY",
+                    "name": "CLIProxyAPI",
+                    "transport": "openai_chat",
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(
+        rp,
+        "resolve_provider",
+        lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError(
+                "resolve_provider should not be called for named custom providers"
+            )
+        ),
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="custom:CLIProxyAPI")
+
+    assert resolved["provider"] == "cliproxyapi"
+    assert resolved["api_mode"] == "chat_completions"
+    assert resolved["base_url"] == "http://127.0.0.1:8317/v1"
+    assert resolved["api_key"] == "cpa-secret"
+    assert resolved["requested_provider"] == "custom:cliproxyapi"
+    assert resolved["source"] == "custom_provider:CLIProxyAPI"
+    assert resolved["model"] == "gpt-5.5"
+
+
 def test_named_custom_provider_same_url_uses_matching_key_env_and_api_mode(monkeypatch):
     """Named custom providers on one gateway must keep their own credentials and protocol."""
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
