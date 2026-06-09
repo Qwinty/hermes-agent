@@ -677,6 +677,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                 if base_url:
                     result = {
                         "name": entry.get("name", ep_name),
+                        "provider_key": ep_name,
                         "base_url": base_url.strip(),
                         "api_key": resolved_api_key,
                         "model": entry.get("default_model", ""),
@@ -707,6 +708,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                     if base_url:
                         result = {
                             "name": display_name,
+                            "provider_key": ep_name,
                             "base_url": base_url.strip(),
                             "api_key": resolved_api_key,
                             "model": entry.get("default_model", ""),
@@ -1021,8 +1023,21 @@ def _resolve_named_custom_runtime(
     ]
     api_key = next((candidate for candidate in api_key_candidates if has_usable_secret(candidate)), "")
 
+    provider_key = str(custom_provider.get("provider_key", "") or "").strip().lower()
+    runtime_provider = "custom"
+    if provider_key:
+        try:
+            import importlib
+
+            _providers = importlib.import_module("providers")
+            _get_profile = getattr(_providers, "get_provider_profile", None)
+            if _get_profile and _get_profile(provider_key) is not None:
+                runtime_provider = provider_key
+        except Exception:
+            pass
+
     result = {
-        "provider": "custom",
+        "provider": runtime_provider,
         "api_mode": custom_provider.get("api_mode")
         or _detect_api_mode_for_url(base_url)
         or "chat_completions",
