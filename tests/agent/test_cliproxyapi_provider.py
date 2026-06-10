@@ -30,10 +30,10 @@ def test_cliproxyapi_gpt_chat_completions_emits_top_level_reasoning_effort():
     assert "extra_body" not in kwargs
 
 
-def test_cliproxyapi_clamps_xhigh_to_high_for_gpt_chat_completions():
+def test_cliproxyapi_preserves_xhigh_for_gpt_chat_completions():
     kwargs = _kwargs_for("gpt-5.5", "xhigh")
 
-    assert kwargs["reasoning_effort"] == "high"
+    assert kwargs["reasoning_effort"] == "xhigh"
 
 
 def test_cliproxyapi_does_not_emit_reasoning_effort_for_gemini_slug():

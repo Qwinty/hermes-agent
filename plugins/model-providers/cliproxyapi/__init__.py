@@ -50,13 +50,9 @@ class CLIProxyAPIProfile(ProviderProfile):
             return {}, {}
 
         effort = str(reasoning_config.get("effort") or "").strip().lower()
-        effort = {
-            "minimal": "low",
-            "xhigh": "high",
-            "max": "high",
-        }.get(effort, effort)
+        effort = {"minimal": "low", "max": "xhigh"}.get(effort, effort)
 
-        if effort in {"low", "medium", "high"}:
+        if effort in {"low", "medium", "high", "xhigh"}:
             return {}, {"reasoning_effort": effort}
 
         return {}, {}
