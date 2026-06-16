@@ -5,7 +5,7 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.platforms.telegram import TelegramAdapter
-from gateway.run import GatewayRunner
+from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL
 from gateway.session import SessionSource, build_session_key
 
 
@@ -49,6 +49,40 @@ def _photo_event(source: SessionSource, path: str = "/tmp/alcohol-study.jpg") ->
     )
 
 
+def _voice_event(source: SessionSource, path: str = "/tmp/client-comment.ogg") -> MessageEvent:
+    return MessageEvent(
+        text="",
+        message_type=MessageType.VOICE,
+        source=source,
+        media_urls=[path],
+        media_types=["audio/ogg"],
+    )
+
+
+def _document_event(source: SessionSource, path: str = "/root/.hermes/cache/documents/doc_abcd_guide.docx") -> MessageEvent:
+    return MessageEvent(
+        text="",
+        message_type=MessageType.DOCUMENT,
+        source=source,
+        media_urls=[path],
+        media_types=["application/vnd.openxmlformats-officedocument.wordprocessingml.document"],
+        forward_origin={"type": "user", "sender_name": "Alice"},
+    )
+
+
+def _forwarded_text_event(source: SessionSource) -> MessageEvent:
+    return MessageEvent(
+        text="sk-or-v1-example\nsecond forwarded text",
+        message_type=MessageType.TEXT,
+        source=source,
+        forward_origin={
+            "type": "user",
+            "sender_name": "Alina",
+            "date": "2026-06-14T21:03:26+00:00",
+        },
+    )
+
+
 def _make_adapter() -> TelegramAdapter:
     adapter = TelegramAdapter.__new__(TelegramAdapter)
     adapter.config = PlatformConfig(enabled=True, token="fake")
@@ -69,7 +103,8 @@ def _make_runner(adapter: TelegramAdapter) -> GatewayRunner:
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._model = "openai/gpt-4.1-mini"
     runner._base_url = None
-    runner._decide_image_input_mode = lambda: "native"
+    runner._decide_image_input_mode = lambda **_kwargs: "native"
+    runner._is_user_authorized = lambda _source: True
     return runner
 
 
@@ -150,3 +185,102 @@ async def test_gateway_merges_priority_queued_photo_followup():
     assert event.message_type == MessageType.PHOTO
     assert event.media_urls == ["/tmp/queued-photo.jpg"]
     assert session_key not in adapter._pending_messages
+
+
+@pytest.mark.asyncio
+async def test_gateway_merges_priority_queued_document_followup_before_first_model_call():
+    source = _source()
+    session_key = build_session_key(source)
+    adapter = _make_adapter()
+    runner = _make_runner(adapter)
+    adapter._pending_messages[session_key] = _document_event(source)
+
+    event = await runner._merge_startup_media_followups(
+        _text_event(source),
+        source,
+        session_key,
+    )
+    message_text = await runner._prepare_inbound_message_text(
+        event=event,
+        source=source,
+        history=[],
+    )
+
+    assert event.message_type == MessageType.DOCUMENT
+    assert event.media_urls == ["/root/.hermes/cache/documents/doc_abcd_guide.docx"]
+    assert event.forward_origin == {"type": "user", "sender_name": "Alice"}
+    assert "The user sent a document: 'guide.docx'" in message_text
+    assert "Is this a real study?" in message_text
+    assert session_key not in adapter._pending_messages
+
+
+@pytest.mark.asyncio
+async def test_gateway_merges_forwarded_text_batch_before_first_model_call():
+    source = _source()
+    session_key = build_session_key(source)
+    adapter = _make_adapter()
+    runner = _make_runner(adapter)
+    adapter._pending_messages[session_key] = _forwarded_text_event(source)
+
+    event = await runner._merge_startup_media_followups(
+        _text_event(source),
+        source,
+        session_key,
+    )
+
+    assert event.message_type == MessageType.TEXT
+    assert event.forward_origin is None
+    assert event.text.startswith("Is this a real study?")
+    assert "[Forwarded message | From: Alina | Date: 2026-06-14T21:03:26+00:00]" in event.text
+    assert "sk-or-v1-example" in event.text
+    assert session_key not in adapter._pending_messages
+
+
+@pytest.mark.asyncio
+async def test_gateway_queues_startup_forwarded_text_batch_without_interrupt_ack():
+    source = _source()
+    session_key = build_session_key(source)
+    adapter = _make_adapter()
+    runner = _make_runner(adapter)
+    runner._running_agents = {session_key: _AGENT_PENDING_SENTINEL}
+    runner._busy_input_mode = "interrupt"
+    runner._busy_text_mode = "interrupt"
+    runner._busy_ack_ts = {}
+    runner._running_agents_ts = {}
+
+    handled = await runner._handle_active_session_busy_message(
+        _forwarded_text_event(source),
+        session_key,
+    )
+
+    assert handled is True
+    assert adapter._pending_messages[session_key].text == "sk-or-v1-example\nsecond forwarded text"
+
+
+@pytest.mark.asyncio
+async def test_forwarded_context_is_rendered_before_inbound_text():
+    source = _source()
+    adapter = _make_adapter()
+    runner = _make_runner(adapter)
+    event = MessageEvent(
+        text="original text",
+        message_type=MessageType.TEXT,
+        source=source,
+        forward_origin={
+            "type": "user",
+            "sender_name": "Skippy",
+            "sender_username": "skippy_bot",
+            "date": "2026-06-14T09:00:00+00:00",
+        },
+    )
+
+    message_text = await runner._prepare_inbound_message_text(
+        event=event,
+        source=source,
+        history=[],
+    )
+
+    assert message_text.startswith(
+        "[Forwarded message | From: Skippy (@skippy_bot) | Date: 2026-06-14T09:00:00+00:00]"
+    )
+    assert message_text.endswith("original text")

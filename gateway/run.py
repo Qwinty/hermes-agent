@@ -5537,12 +5537,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         media_types = getattr(event, "media_types", None) or []
         return any(str(mtype).startswith("image/") for mtype in media_types)
 
-    def _pop_adapter_pending_image_event(self, adapter: Any, session_key: str) -> Optional[MessageEvent]:
+    @staticmethod
+    def _event_has_batch_media(event: Optional[MessageEvent]) -> bool:
+        if event is None:
+            return False
+        media_urls = getattr(event, "media_urls", None) or []
+        if not media_urls:
+            return False
+        message_type = getattr(event, "message_type", None)
+        batch_media_types = {
+            MessageType.PHOTO,
+            MessageType.VIDEO,
+            MessageType.AUDIO,
+            MessageType.VOICE,
+            MessageType.DOCUMENT,
+        }
+        video_note_type = getattr(MessageType, "VIDEO_NOTE", None)
+        if video_note_type is not None:
+            batch_media_types.add(video_note_type)
+        if message_type in batch_media_types:
+            return True
+        media_types = getattr(event, "media_types", None) or []
+        return any(
+            str(mtype).startswith(("image/", "audio/", "video/"))
+            or str(mtype) == "application/octet-stream"
+            or str(mtype).startswith("application/")
+            for mtype in media_types
+        )
+
+    @staticmethod
+    def _event_has_forwarded_text_context(event: Optional[MessageEvent]) -> bool:
+        if event is None:
+            return False
+        if getattr(event, "message_type", None) != MessageType.TEXT:
+            return False
+        if getattr(event, "media_urls", None):
+            return False
+        if getattr(event, "forward_origin", None):
+            return True
+        text = (getattr(event, "text", None) or "").lstrip()
+        return text.startswith("[Forwarded message |")
+
+    @classmethod
+    def _event_can_join_startup_batch(cls, event: Optional[MessageEvent]) -> bool:
+        return cls._event_has_batch_media(event) or cls._event_has_forwarded_text_context(event)
+
+    def _pop_adapter_pending_startup_event(self, adapter: Any, session_key: str) -> Optional[MessageEvent]:
         pending_messages = getattr(adapter, "_pending_messages", None)
         if not pending_messages:
             return None
         pending_event = pending_messages.get(session_key)
-        if not self._event_has_image_media(pending_event):
+        if not self._event_can_join_startup_batch(pending_event):
             return None
         return pending_messages.pop(session_key, None)
 
@@ -5565,6 +5610,58 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not math.isfinite(value):
             value = 1.0
         return max(0.0, min(value, 3.0))
+
+    @staticmethod
+    def _format_forward_origin_context(forward_origin: Optional[Dict[str, str]]) -> Optional[str]:
+        if not forward_origin:
+            return None
+
+        parts = ["Forwarded message"]
+        if forward_origin.get("automatic") == "true":
+            parts.append("automatic forward")
+
+        sender = forward_origin.get("sender_name")
+        if sender:
+            username = forward_origin.get("sender_username")
+            if username:
+                sender = f"{sender} (@{username})"
+            parts.append(f"From: {sender}")
+        elif forward_origin.get("type") == "hidden_user":
+            parts.append("From: hidden sender")
+
+        chat = forward_origin.get("chat_name")
+        if chat:
+            username = forward_origin.get("chat_username")
+            if username:
+                chat = f"{chat} (@{username})"
+            parts.append(f"Chat: {chat}")
+
+        author_signature = forward_origin.get("author_signature")
+        if author_signature:
+            parts.append(f"Author: {author_signature}")
+
+        date = forward_origin.get("date")
+        if date:
+            parts.append(f"Date: {date}")
+
+        return "[" + " | ".join(parts) + "]"
+
+    def _inline_forward_context_for_text_followup(self, event: MessageEvent) -> MessageEvent:
+        if not self._event_has_forwarded_text_context(event):
+            return event
+        if not getattr(event, "forward_origin", None):
+            return event
+        forward_context = self._format_forward_origin_context(event.forward_origin)
+        if not forward_context:
+            return event
+        text = event.text or ""
+        if text.lstrip().startswith("[Forwarded message |"):
+            return dataclasses.replace(event, forward_origin=None)
+        return dataclasses.replace(
+            event,
+            text=f"{forward_context}\n\n{text}" if text else forward_context,
+            forward_origin=None,
+        )
 
     async def _merge_startup_media_followups(
         self,
@@ -5596,6 +5693,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         loop = asyncio.get_running_loop()
         deadline = loop.time() + grace
         merged_count = 0
+        merged_text_batches = 0
         pop_startup_media_event = self._adapter_declared_method(adapter, "pop_startup_media_event")
         has_startup_media_pending = self._adapter_declared_method(adapter, "has_startup_media_pending")
 
@@ -5609,8 +5707,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     incoming = None
 
             if incoming is not None:
+                if self._event_has_forwarded_text_context(incoming):
+                    incoming = self._inline_forward_context_for_text_followup(incoming)
+                    merged_text_batches += 1
                 slot = {session_key: event}
-                merge_pending_message_event(slot, session_key, incoming)
+                merge_pending_message_event(slot, session_key, incoming, merge_text=True)
                 event = slot[session_key]
                 merged_count += len(getattr(incoming, "media_urls", None) or [])
                 continue
@@ -5622,14 +5723,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     logger.debug("Telegram startup media pending check failed", exc_info=True)
                     has_pending = False
-            if not has_pending or loop.time() >= deadline:
+            if merged_count and not has_pending:
+                break
+            if merged_text_batches and not has_pending:
+                break
+            if loop.time() >= deadline:
                 break
             await asyncio.sleep(min(0.05, max(0.0, deadline - loop.time())))
 
-        if merged_count:
+        if merged_count or merged_text_batches:
             logger.info(
-                "Merged %d Telegram startup image(s) into text turn for session %s",
+                "Merged %d Telegram startup attachment(s) and %d forwarded text batch(es) into text turn for session %s",
                 merged_count,
+                merged_text_batches,
                 session_key,
             )
         return event
@@ -5777,6 +5883,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         effective_mode = self._busy_input_mode
         busy_text_mode = getattr(self, "_busy_text_mode", "interrupt")
+        if (
+            event.source.platform == Platform.TELEGRAM
+            and running_agent is _AGENT_PENDING_SENTINEL
+            and self._event_has_forwarded_text_context(event)
+        ):
+            logger.debug(
+                "Queueing Telegram startup forwarded text batch for session %s without interrupt/ack",
+                session_key,
+            )
+            merge_pending_message_event(
+                adapter._pending_messages,
+                session_key,
+                event,
+                merge_text=True,
+            )
+            return True
+        if self._event_has_batch_media(event):
+            logger.debug(
+                "Queueing busy media follow-up for session %s without interrupt/ack",
+                session_key,
+            )
+            merge_pending_message_event(
+                adapter._pending_messages,
+                session_key,
+                event,
+            )
+            return True
         if (
             event.message_type == MessageType.TEXT
             and busy_text_mode == "queue"
@@ -14638,6 +14771,49 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.warning("Post-stream media extraction failed: %s", e)
 
 
+    async def _send_queued_first_response(
+        self,
+        response: str,
+        event: MessageEvent,
+        adapter,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Deliver a queued-turn first response with normal media handling.
+
+        The queued follow-up path cannot hand the response back to
+        ``BasePlatformAdapter._process_message_background()``, so sending the raw
+        text through ``adapter.send()`` would expose MEDIA directives and skip
+        attachments. Mirror the normal response pipeline: send only display text,
+        then deliver extracted MEDIA/local files separately.
+        """
+        if not response:
+            return
+
+        text_content = response
+        try:
+            from gateway.platforms.base import _strip_media_directives
+
+            _, text_content = adapter.extract_media(text_content)
+            _, text_content = adapter.extract_images(text_content)
+            _, text_content = adapter.extract_local_files(text_content)
+            text_content = _strip_media_directives(text_content).strip()
+        except Exception as exc:
+            logger.warning(
+                "[%s] Queued follow-up response media cleanup failed: %s",
+                getattr(adapter, "name", "adapter"),
+                exc,
+            )
+            text_content = response
+
+        if text_content:
+            await adapter.send(
+                event.source.chat_id,
+                text_content,
+                metadata=metadata,
+            )
+
+        await self._deliver_media_from_response(response, event, adapter)
+
 
     async def _run_background_task(
         self,
@@ -21129,9 +21305,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                                 session_key or "?",
                             )
-                            await adapter.send(
-                                source.chat_id,
+                            response_event = MessageEvent(
+                                text="",
+                                message_type=MessageType.TEXT,
+                                source=source,
+                                message_id=event_message_id,
+                            )
+                            await self._send_queued_first_response(
                                 first_response,
+                                response_event,
+                                adapter,
                                 metadata=_status_thread_metadata,
                             )
                         except Exception as e:
