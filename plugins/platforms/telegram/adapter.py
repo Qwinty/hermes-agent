@@ -8248,6 +8248,7 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.debug("[Telegram] Dropping text batch enqueue after disconnect started")
             return
 
+        event = self._event_with_inline_forward_context(event)
         key = self._text_batch_key(event)
         existing = self._pending_text_batches.get(key)
         chunk_len = len(event.text or "")
@@ -8271,6 +8272,53 @@ class TelegramAdapter(BasePlatformAdapter):
         self._pending_text_batch_tasks[key] = asyncio.create_task(
             self._flush_text_batch(key)
         )
+
+    @staticmethod
+    def _format_forward_origin_context(forward_origin: Optional[Dict[str, str]]) -> Optional[str]:
+        if not forward_origin:
+            return None
+
+        parts = ["Forwarded message"]
+        if forward_origin.get("automatic") == "true":
+            parts.append("automatic forward")
+
+        sender = forward_origin.get("sender_name")
+        if sender:
+            username = forward_origin.get("sender_username")
+            if username:
+                sender = f"{sender} (@{username})"
+            parts.append(f"From: {sender}")
+        elif forward_origin.get("type") == "hidden_user":
+            parts.append("From: hidden sender")
+
+        chat = forward_origin.get("chat_name")
+        if chat:
+            username = forward_origin.get("chat_username")
+            if username:
+                chat = f"{chat} (@{username})"
+            parts.append(f"Chat: {chat}")
+
+        author_signature = forward_origin.get("author_signature")
+        if author_signature:
+            parts.append(f"Author: {author_signature}")
+
+        date = forward_origin.get("date")
+        if date:
+            parts.append(f"Date: {date}")
+
+        return "[" + " | ".join(parts) + "]"
+
+    def _event_with_inline_forward_context(self, event: MessageEvent) -> MessageEvent:
+        forward_context = self._format_forward_origin_context(getattr(event, "forward_origin", None))
+        if not forward_context:
+            return event
+        text = event.text or ""
+        if text.lstrip().startswith("[Forwarded message |"):
+            event.forward_origin = None
+            return event
+        event.text = f"{forward_context}\n\n{text}" if text else forward_context
+        event.forward_origin = None
+        return event
 
     async def _flush_text_batch(self, key: str) -> None:
         """Wait for the quiet period then dispatch the aggregated text.
