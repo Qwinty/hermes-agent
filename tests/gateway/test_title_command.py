@@ -15,13 +15,15 @@ from gateway.session import SessionSource
 
 
 def _make_event(text="/title", platform=Platform.TELEGRAM,
-                user_id="12345", chat_id="67890"):
+                user_id="12345", chat_id="67890", thread_id=None):
     """Build a MessageEvent for testing."""
     source = SessionSource(
         platform=platform,
         user_id=user_id,
         chat_id=chat_id,
         user_name="testuser",
+        chat_type="dm" if platform == Platform.TELEGRAM else None,
+        thread_id=thread_id,
     )
     return MessageEvent(text=text, source=source)
 
@@ -72,6 +74,43 @@ class TestHandleTitleCommand:
 
         # Verify in DB
         assert db.get_session_title("test_session_123") == "My Research Project"
+        db.close()
+
+    @pytest.mark.asyncio
+    async def test_set_title_renames_bound_telegram_topic(self, tmp_path):
+        """Setting a title inside a Telegram topic lane renames that topic."""
+        from hermes_state import SessionDB
+        db = SessionDB(db_path=tmp_path / "state.db")
+        db.apply_telegram_topic_migration()
+        db.create_session("test_session_123", "telegram", user_id="12345")
+        db.bind_telegram_topic(
+            chat_id="67890",
+            thread_id="42",
+            user_id="12345",
+            session_key="agent:main:telegram:dm:67890:42",
+            session_id="test_session_123",
+        )
+
+        runner = _make_runner(session_db=db)
+        runner.config = GatewayConfig(
+            platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
+        )
+        adapter = MagicMock()
+        adapter.rename_dm_topic = AsyncMock()
+        adapter._bot = None
+        runner.adapters = {Platform.TELEGRAM: adapter}
+        runner._telegram_topic_mode_enabled = lambda source: True
+
+        event = _make_event(text="/title My Research Project", thread_id="42")
+        result = await runner._handle_title_command(event)
+
+        assert "My Research Project" in result
+        assert db.get_session_title("test_session_123") == "My Research Project"
+        adapter.rename_dm_topic.assert_awaited_once_with(
+            chat_id="67890",
+            thread_id="42",
+            name="My Research Project",
+        )
         db.close()
 
     @pytest.mark.asyncio
