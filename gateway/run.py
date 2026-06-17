@@ -6781,6 +6781,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         exc_info=True,
                     )
                 continue
+            if self._resume_pending_completed_after_marker(entry, effective_session_id):
+                logger.info(
+                    "Skipping auto-resume for %s: transcript already has a "
+                    "completed assistant reply after resume marker",
+                    entry.session_key,
+                )
+                try:
+                    self.session_store.clear_resume_pending(entry.session_key)
+                except Exception:
+                    logger.debug(
+                        "clear_resume_pending after completed auto-resume skip failed for %s",
+                        entry.session_key,
+                        exc_info=True,
+                    )
+                continue
 
             # Claim the session slot *before* spawning the task so that an
             # inbound message arriving between task creation and the task's
@@ -6851,6 +6866,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 service_restart=self._restart_via_service,
             )
         return True
+
+    def _resume_pending_completed_after_marker(self, entry, session_id: Optional[str]) -> bool:
+        """Return True when the transcript already completed after resume marking.
+
+        Shutdown/restart marks active sessions as ``resume_pending`` before the
+        drain wait so a hard-killed process can recover.  A turn can still finish
+        during that drain window and persist/send a normal assistant answer.  In
+        that case startup auto-resume must not synthesize an empty user turn, or
+        the model repeats the just-delivered answer and replies to an old topic
+        anchor.
+        """
+        session_db = getattr(self, "_session_db", None)
+        if session_db is None or not session_id:
+            return False
+        marker = _coerce_gateway_timestamp(
+            getattr(entry, "last_resume_marked_at", None)
+            or getattr(entry, "updated_at", None)
+        )
+        if marker is None:
+            return False
+        try:
+            messages = session_db.get_messages(session_id)
+        except Exception:
+            logger.debug(
+                "Could not inspect transcript completion for startup auto-resume",
+                exc_info=True,
+            )
+            return False
+
+        saw_visible_assistant_since_user = False
+        saw_visible_assistant_after_marker = False
+        for msg in reversed(messages or []):
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role")
+            if not role or role in {"session_meta", "system"}:
+                continue
+            if role == "user" and msg.get("content"):
+                return saw_visible_assistant_since_user
+            if role == "assistant" and msg.get("content") and not msg.get("tool_calls"):
+                saw_visible_assistant_since_user = True
+
+        for msg in messages or []:
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role")
+            if not role or role in {"session_meta", "system"}:
+                continue
+            timestamp = _coerce_gateway_timestamp(msg.get("timestamp"))
+            if timestamp is None or timestamp < marker:
+                continue
+            if role == "user" and msg.get("content"):
+                # A real post-marker user turn supersedes this stale startup
+                # marker; do not classify it as an already-completed drain.
+                return False
+            if role == "assistant" and msg.get("content") and not msg.get("tool_calls"):
+                saw_visible_assistant_after_marker = True
+        return saw_visible_assistant_since_user or saw_visible_assistant_after_marker
 
     def _effective_resume_session_id(self, entry) -> str:
         """Return the transcript session id an auto-resume would actually use."""
