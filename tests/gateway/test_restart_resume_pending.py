@@ -411,6 +411,38 @@ class TestGetOrCreateResumePending:
         assert second.resume_pending is True
         mock_tip.assert_called_with(original_sid)
 
+    def test_existing_session_refreshes_origin_message_id(self, tmp_path):
+        """The persisted origin must track the latest triggering message id."""
+        store = _make_store(tmp_path)
+        source = _make_source()
+        source.message_id = "first-message"
+        first = store.get_or_create_session(source)
+
+        later_source = _make_source()
+        later_source.message_id = "latest-message"
+        second = store.get_or_create_session(later_source)
+
+        assert second.session_id == first.session_id
+        assert second.origin is not None
+        assert second.origin.message_id == "latest-message"
+
+    def test_resume_pending_refreshes_origin_message_id_before_return(self, tmp_path):
+        """The resume_pending early-return path must not keep a stale anchor."""
+        store = _make_store(tmp_path)
+        source = _make_source()
+        source.message_id = "first-message"
+        first = store.get_or_create_session(source)
+        store.mark_resume_pending(first.session_key)
+
+        later_source = _make_source()
+        later_source.message_id = "latest-message"
+        second = store.get_or_create_session(later_source)
+
+        assert second.session_id == first.session_id
+        assert second.resume_pending is True
+        assert second.origin is not None
+        assert second.origin.message_id == "latest-message"
+
     def test_suspended_still_creates_new_session(self, tmp_path):
         """Regression guard — suspended must still force a clean slate."""
         store = _make_store(tmp_path)
@@ -1081,6 +1113,43 @@ async def test_startup_auto_resume_schedules_fresh_pending_sessions():
     # _handle_message_with_agent owns the system-note injection so we don't
     # double it up.
     assert event.text == ""
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_preserves_triggering_reply_anchor():
+    """Synthetic resume events must keep the last Telegram DM-topic anchor.
+
+    Without this, startup auto-resume still routes into the DM topic via
+    ``direct_messages_topic_id``, but Telegram can visually attach the bot
+    reply to the topic's first/seed message instead of the user message that
+    originally triggered the interrupted turn.
+    """
+    runner, adapter = make_restart_runner()
+    source = make_restart_source(chat_id="resume-chat", thread_id="topic-1")
+    source.message_id = "user-msg-42"
+    pending_entry = SessionEntry(
+        session_key="agent:main:telegram:dm:resume-chat:topic-1",
+        session_id="sid",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=datetime.now(),
+    )
+    runner.session_store._entries = {pending_entry.session_key: pending_entry}
+    adapter.handle_message = AsyncMock()
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.message_id == "user-msg-42"
+    assert event.reply_to_message_id == "user-msg-42"
 
 
 @pytest.mark.asyncio

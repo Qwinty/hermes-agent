@@ -7174,6 +7174,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 text="",
                 message_type=MessageType.TEXT,
                 source=source,
+                message_id=getattr(source, "message_id", None),
+                reply_to_message_id=getattr(source, "message_id", None),
                 internal=True,
             )
             task = asyncio.create_task(

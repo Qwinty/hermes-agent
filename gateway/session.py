@@ -1727,6 +1727,11 @@ class SessionStore:
                 self._heal_compression_tip_locked(
                     entry, existing_session_id, canonical_existing_session_id
                 )
+                if source.message_id:
+                    if entry.origin is None:
+                        entry.origin = source
+                    else:
+                        entry.origin.message_id = source.message_id
 
                 # Self-heal stale routing: if this session_key still points at
                 # a session that has ALREADY been ended in state.db (end_reason
