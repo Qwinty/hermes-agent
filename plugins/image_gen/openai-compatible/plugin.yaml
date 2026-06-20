@@ -1,0 +1,6 @@
+name: openai-compatible
+version: 1.0.0
+description: "OpenAI-compatible image generation backend for /v1/images/generations and /v1/images/edits endpoints. Supports local proxies such as CLIProxyAPI/CPA."
+author: NousResearch
+kind: backend
+requires_env: []
