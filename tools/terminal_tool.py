@@ -76,6 +76,47 @@ from tools.tool_backend_helpers import (
 )
 
 
+# ---------------------------------------------------------------------------
+# Gateway lifecycle allowlist — local override
+# ---------------------------------------------------------------------------
+# `hermes gateway restart` uses SIGUSR1 graceful drain (not SIGTERM), so
+# child processes — including terminal-tool subprocesses spawned from inside
+# the gateway — survive the restart cycle. This makes it safe to run from
+# inside the gateway, unlike `systemctl restart`, `pkill`, or
+# `hermes gateway stop`, which SIGTERM the cgroup and kill mid-flight work.
+#
+# The allowlist is narrow: only `hermes gateway restart` (with optional
+# flags like --system, --all) is permitted. Any other lifecycle command in
+# the same string (systemctl, pkill, launchctl, hermes gateway stop) makes
+# the whole command unsafe and it stays blocked.
+
+_SAFE_RESTART_RE = re.compile(r"\bhermes\s+gateway\s+restart\b", re.IGNORECASE)
+_OTHER_LIFECYCLE_RES = [
+    re.compile(p, re.IGNORECASE)
+    for p in (
+        r"\bsystemctl\b",
+        r"\bp?kill\b",
+        r"\blaunchctl\b",
+        r"\bhermes\s+gateway\s+(?:stop|start)\b",
+    )
+]
+
+
+def _is_safe_gateway_restart_only(command: str) -> bool:
+    """Return True if *command* is a safe ``hermes gateway restart`` with no other lifecycle commands.
+
+    ``hermes gateway restart`` uses SIGUSR1 graceful drain — child processes
+    survive. Other lifecycle commands (systemctl, pkill, hermes gateway stop)
+    SIGTERM the cgroup and kill mid-flight work, so they remain blocked.
+    """
+    if not _SAFE_RESTART_RE.search(command):
+        return False
+    for pat in _OTHER_LIFECYCLE_RES:
+        if pat.search(command):
+            return False
+    return True
+
+
 def _safe_parse_import_env(
     name: str,
     default: Any,
@@ -2234,21 +2275,27 @@ def terminal_tool(
         # never restart. This mirrors the `hermes gateway restart` guard in
         # hermes_cli/gateway.py and the cron-path guard in hermes_cli/cron.py,
         # but applies unconditionally (force=True cannot help here).
+        #
+        # Local override: `hermes gateway restart` is exempted because it uses
+        # SIGUSR1 graceful drain (not SIGTERM) — child processes survive the
+        # restart cycle. Other lifecycle commands (systemctl, pkill,
+        # hermes gateway stop) still kill the process tree and remain blocked.
         if os.environ.get("_HERMES_GATEWAY") == "1":
             from hermes_cli.cron import _contains_gateway_lifecycle_command
             if _contains_gateway_lifecycle_command(command):
-                return json.dumps({
-                    "output": "",
-                    "exit_code": 1,
-                    "error": (
-                        "Blocked: cannot restart or stop the gateway from inside the "
-                        "gateway process. The gateway would kill this command before "
-                        "it could complete (SIGTERM propagates to child processes). "
-                        "Run `hermes gateway restart` from a separate shell outside "
-                        "the running gateway."
-                    ),
-                    "status": "error",
-                }, ensure_ascii=False)
+                if not _is_safe_gateway_restart_only(command):
+                    return json.dumps({
+                        "output": "",
+                        "exit_code": 1,
+                        "error": (
+                            "Blocked: cannot restart or stop the gateway from inside the "
+                            "gateway process. The gateway would kill this command before "
+                            "it could complete (SIGTERM propagates to child processes). "
+                            "Run `hermes gateway restart` from a separate shell outside "
+                            "the running gateway, or use the /restart slash command."
+                        ),
+                        "status": "error",
+                    }, ensure_ascii=False)
 
         # Pre-exec security checks (tirith + dangerous command detection)
         # Skip check if force=True (user has confirmed they want to run it)
