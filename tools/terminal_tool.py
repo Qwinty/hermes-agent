@@ -37,6 +37,7 @@ import logging
 import os
 import platform
 import re
+import shlex
 import time
 import threading
 import atexit
@@ -90,31 +91,53 @@ from tools.tool_backend_helpers import (
 # the same string (systemctl, pkill, launchctl, hermes gateway stop) makes
 # the whole command unsafe and it stays blocked.
 
-_SAFE_RESTART_RE = re.compile(r"\bhermes\s+gateway\s+restart\b", re.IGNORECASE)
-_OTHER_LIFECYCLE_RES = [
-    re.compile(p, re.IGNORECASE)
-    for p in (
-        r"\bsystemctl\b",
-        r"\bp?kill\b",
-        r"\blaunchctl\b",
-        r"\bhermes\s+gateway\s+(?:stop|start)\b",
-    )
-]
+_SAFE_GATEWAY_RESTART_ARGV = ("hermes", "gateway", "restart")
+
+
+def _safe_gateway_restart_argv(command: str) -> list[str] | None:
+    """Return argv when *command* is exactly ``hermes gateway restart``.
+
+    The terminal backend executes shell strings, so do not validate lifecycle
+    exceptions with regexes over shell syntax. Command substitutions, redirects,
+    newlines, and env wrappers can all execute before ``env -u`` gets a chance
+    to remove ``_HERMES_GATEWAY``. Parse as argv and allow only the minimal safe
+    restart form.
+    """
+    if not command or "\n" in command or "\r" in command:
+        return None
+    try:
+        argv = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    if tuple(argv) != _SAFE_GATEWAY_RESTART_ARGV:
+        return None
+    return argv
 
 
 def _is_safe_gateway_restart_only(command: str) -> bool:
-    """Return True if *command* is a safe ``hermes gateway restart`` with no other lifecycle commands.
+    """Return True for a standalone safe ``hermes gateway restart`` command.
 
     ``hermes gateway restart`` uses SIGUSR1 graceful drain — child processes
-    survive. Other lifecycle commands (systemctl, pkill, hermes gateway stop)
-    SIGTERM the cgroup and kill mid-flight work, so they remain blocked.
+    survive. Keep this intentionally narrow: flags, shell chains, pipes, env
+    wrappers, redirects, and other lifecycle commands stay blocked so a mixed
+    command cannot smuggle unsafe work through the allowlist.
     """
-    if not _SAFE_RESTART_RE.search(command):
-        return False
-    for pat in _OTHER_LIFECYCLE_RES:
-        if pat.search(command):
-            return False
-    return True
+    return _safe_gateway_restart_argv(command) is not None
+
+
+def _gateway_restart_command_for_child(command: str) -> str:
+    """Run the safe restart as a non-gateway child process.
+
+    The terminal tool itself runs inside the gateway and therefore has
+    ``_HERMES_GATEWAY=1``. The child ``hermes gateway restart`` CLI also checks
+    that marker and would refuse to run unless we explicitly remove it for this
+    one safe command. Build the shell command from validated argv with
+    ``shlex.join`` rather than embedding raw user text.
+    """
+    argv = _safe_gateway_restart_argv(command)
+    if argv is None:
+        raise ValueError("not a safe gateway restart command")
+    return shlex.join(["env", "-u", "_HERMES_GATEWAY", *argv])
 
 
 def _safe_parse_import_env(
@@ -2303,7 +2326,9 @@ def terminal_tool(
         if os.environ.get("_HERMES_GATEWAY") == "1":
             from hermes_cli.cron import _contains_gateway_lifecycle_command
             if _contains_gateway_lifecycle_command(command):
-                if not _is_safe_gateway_restart_only(command):
+                if _is_safe_gateway_restart_only(command):
+                    command = _gateway_restart_command_for_child(command)
+                else:
                     return json.dumps({
                         "output": "",
                         "exit_code": 1,
