@@ -19659,6 +19659,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     model, runtime_kwargs.get("provider"), session_key or "",
                 )
             except Exception as exc:
+                logger.warning(
+                    "Gateway runtime resolution failed for session=%s source=%s: %s",
+                    session_key or "",
+                    getattr(source, "platform", None),
+                    exc,
+                    exc_info=True,
+                )
                 return {
                     "final_response": f"⚠️ Provider authentication failed: {exc}",
                     "messages": [],
