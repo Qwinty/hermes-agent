@@ -89,6 +89,33 @@ from tools.tool_backend_helpers import (
 )
 
 
+# A graceful CLI restart is the sole lifecycle operation that may be launched
+# from inside the gateway: it signals the parent and deliberately lets this
+# terminal child finish. Keep this exact-argv only — no flags or shell syntax.
+_SAFE_GATEWAY_RESTART_ARGV = ("hermes", "gateway", "restart")
+
+
+def _safe_gateway_restart_argv(command: str) -> list[str] | None:
+    if not command or "\n" in command or "\r" in command:
+        return None
+    try:
+        argv = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    return argv if tuple(argv) == _SAFE_GATEWAY_RESTART_ARGV else None
+
+
+def _is_safe_gateway_restart_only(command: str) -> bool:
+    return _safe_gateway_restart_argv(command) is not None
+
+
+def _gateway_restart_command_for_child(command: str) -> str:
+    argv = _safe_gateway_restart_argv(command)
+    if argv is None:
+        raise ValueError("not a safe gateway restart command")
+    return shlex.join(["env", "-u", "_HERMES_GATEWAY", *argv])
+
+
 def _safe_parse_import_env(
     name: str,
     default: Any,
@@ -2865,10 +2892,13 @@ def terminal_tool(
                     pass
                 return None
 
-            if contains_gateway_lifecycle_command_or_referenced_script(
-                command,
-                cwd=guard_cwd,
-                read_remote_script=_read_script_in_env,
+            if (
+                not _is_safe_gateway_restart_only(command)
+                and contains_gateway_lifecycle_command_or_referenced_script(
+                    command,
+                    cwd=guard_cwd,
+                    read_remote_script=_read_script_in_env,
+                )
             ):
                 return json.dumps({
                     "output": "",
@@ -3268,7 +3298,13 @@ def terminal_tool(
                         # reads, RPC reads) intentionally stay unbounded.
                         "bounded_capture": True,
                     }
-                    result = env.execute(command, **execute_kwargs)
+                    execution_command = (
+                        _gateway_restart_command_for_child(command)
+                        if os.environ.get("_HERMES_GATEWAY") == "1"
+                        and _is_safe_gateway_restart_only(command)
+                        else command
+                    )
+                    result = env.execute(execution_command, **execute_kwargs)
                 except Exception as e:
                     error_str = str(e).lower()
                     if "timeout" in error_str:
