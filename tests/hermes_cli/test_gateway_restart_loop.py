@@ -337,6 +337,48 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert result["exit_code"] == 1
         assert "Blocked" in result["error"]
 
+    def test_safe_hermes_gateway_restart_unsets_marker_and_passes_through(self, monkeypatch):
+        """Local override: `hermes gateway restart` is safe via SIGUSR1.
+
+        The child CLI would otherwise inherit _HERMES_GATEWAY=1 and refuse to
+        run. terminal_tool must strip that marker for this one safe command.
+        """
+        import tools.terminal_tool as tt
+
+        calls = []
+
+        class _FakeEnv:
+            env = {}
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": "restart requested", "returncode": 0}
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        monkeypatch.setattr(tt, "_check_all_guards", lambda cmd, env: {"approved": True})
+
+        result = json.loads(tt.terminal_tool(command="hermes gateway restart"))
+
+        assert result["exit_code"] == 0
+        assert calls == ["env -u _HERMES_GATEWAY hermes gateway restart"]
+
+    def test_safe_hermes_gateway_restart_force_true_also_passes_through(self, monkeypatch):
+        import tools.terminal_tool as tt
+
+        calls = []
+
+        class _FakeEnv:
+            env = {}
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": "restart requested", "returncode": 0}
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+
+        result = json.loads(tt.terminal_tool(command="hermes gateway restart", force=True))
+
+        assert result["exit_code"] == 0
+        assert calls == ["env -u _HERMES_GATEWAY hermes gateway restart"]
+
     def test_safe_systemctl_commands_pass_through(self, monkeypatch):
         """Non-hermes systemctl commands must not be blocked by this guard."""
         import tools.terminal_tool as tt
