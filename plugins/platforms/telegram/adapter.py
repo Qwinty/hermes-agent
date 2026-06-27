@@ -4192,6 +4192,15 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
                 return SendResult(success=False, error=str(e))
 
+        if not finalize:
+            # Streaming edits must never create continuation messages. The
+            # stream consumer keeps editing the same message id with the full
+            # accumulated text; if a mid-stream overflow sends a continuation,
+            # the next edit targets a new bubble and duplicates the transcript
+            # indefinitely (#48648). Keep the preview clipped to one editable
+            # message and let the final edit deliver full continuations.
+            return SendResult(success=True, message_id=message_id)
+
         # Step 2 — send each remaining chunk as a continuation message,
         # threaded as a reply to the previous so the user sees them as a
         # contiguous block.  We call self._bot.send_message directly so the
