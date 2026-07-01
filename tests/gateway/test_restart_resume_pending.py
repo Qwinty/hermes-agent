@@ -28,6 +28,7 @@ PRs #9850, #9934, #7536):
 import asyncio
 import time
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -35,6 +36,7 @@ import pytest
 from gateway.config import GatewayConfig, HomeChannel, Platform
 from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.run import (
+    GatewayRunner,
     _AGENT_PENDING_SENTINEL,
     _auto_continue_freshness_window,
     _coerce_gateway_timestamp,
@@ -220,6 +222,53 @@ def _simulate_note_injection(
             f"history.]"
         )
     return message
+
+
+class _FakeResumeSessionDB:
+    def __init__(self, *, binding_session_id="bound-session", message_count=2, messages=None):
+        self.binding_session_id = binding_session_id
+        self._message_count = message_count
+        self._messages = messages if messages is not None else []
+
+    def get_telegram_topic_binding(self, *, chat_id, thread_id):
+        return {"session_id": self.binding_session_id}
+
+    def message_count(self, session_id):
+        return self._message_count
+
+    def get_messages(self, session_id):
+        return list(self._messages)
+
+
+def test_startup_resume_helpers_use_async_db_wrapper_sync_core():
+    """Startup auto-resume helpers run before async context; use AsyncSessionDB._db."""
+    marker = datetime.now()
+    db = _FakeResumeSessionDB(
+        binding_session_id="bound-session",
+        message_count=2,
+        messages=[
+            {"role": "user", "content": "please continue", "timestamp": marker.isoformat()},
+            {"role": "tool", "content": "partial", "timestamp": marker.isoformat()},
+        ],
+    )
+    runner = object.__new__(GatewayRunner)
+    runner._session_db = SimpleNamespace(_db=db)
+    entry = SimpleNamespace(
+        session_id="old-session",
+        origin=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="273403055",
+            user_id="273403055",
+            chat_type="dm",
+            thread_id="385990",
+        ),
+        last_resume_marked_at=marker,
+        updated_at=marker,
+    )
+
+    assert runner._effective_resume_session_id(entry) == "bound-session"
+    assert runner._has_resume_transcript("bound-session") is True
+    assert runner._resume_pending_completed_after_marker(entry, "bound-session") is False
 
 
 # ---------------------------------------------------------------------------
