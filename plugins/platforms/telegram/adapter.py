@@ -6981,8 +6981,22 @@ class TelegramAdapter(BasePlatformAdapter):
     def _clean_bot_trigger_text(self, text: Optional[str]) -> Optional[str]:
         if not text or not self._bot or not getattr(self._bot, "username", None):
             return text
-        username = re.escape(self._bot.username)
-        cleaned = re.sub(rf"(?i)@{username}\b[,:\-]*\s*", "", text).strip()
+        username = re.escape(str(self._bot.username).lstrip("@"))
+
+        # Telegram group command menus address bots as /cmd@BotName args.
+        # Removing the @BotName suffix plus following whitespace directly would
+        # collapse the command and its first argument into /cmdargs. Preserve one
+        # separator when there is text after the bot suffix.
+        command_suffix = re.compile(
+            rf"(?i)(?P<cmd>/[a-z0-9_]+)@{username}\b[,:\-]*\s*"
+        )
+
+        def _strip_command_suffix(match: re.Match) -> str:
+            rest = text[match.end():]
+            return f"{match.group('cmd')} " if rest.strip() else match.group("cmd")
+
+        cleaned = command_suffix.sub(_strip_command_suffix, text)
+        cleaned = re.sub(rf"(?i)@{username}\b[,:\-]*\s*", "", cleaned).strip()
         return cleaned or text
 
     def _should_observe_unmentioned_group_message(self, message: Message) -> bool:
