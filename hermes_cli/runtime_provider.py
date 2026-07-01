@@ -1791,8 +1791,19 @@ def resolve_runtime_provider(
                 "scope": getattr(entry, "scope", None),
             }
             if not _agent_key_is_usable(nous_state, min_ttl):
-                logger.debug("Nous pool entry agent_key expired/missing, falling through to runtime resolution")
-                pool_api_key = ""
+                logger.debug("Nous pool entry agent_key expired/missing, refreshing selected pool entry")
+                try:
+                    refreshed = pool.try_refresh_current()
+                except Exception:
+                    refreshed = None
+                if refreshed is not None:
+                    entry = refreshed
+                    pool_api_key = (
+                        getattr(entry, "runtime_api_key", None)
+                        or getattr(entry, "access_token", "")
+                    )
+                else:
+                    pool_api_key = ""
         if entry is not None and pool_api_key:
             return _resolve_runtime_from_pool_entry(
                 provider=provider,
