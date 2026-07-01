@@ -7,6 +7,8 @@ Covers the threading behavior control for multi-chunk replies:
 """
 import os
 import sys
+import types
+from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch
 
 import pytest
@@ -18,15 +20,52 @@ def _ensure_telegram_mock():
     """Mock the telegram package if it's not installed."""
     if "telegram" in sys.modules and hasattr(sys.modules["telegram"], "__file__"):
         return
-    mod = MagicMock()
-    mod.ext.ContextTypes.DEFAULT_TYPE = type(None)
-    mod.constants.ParseMode.MARKDOWN_V2 = "MarkdownV2"
-    mod.constants.ChatType.GROUP = "group"
-    mod.constants.ChatType.SUPERGROUP = "supergroup"
-    mod.constants.ChatType.CHANNEL = "channel"
-    mod.constants.ChatType.PRIVATE = "private"
-    for name in ("telegram", "telegram.ext", "telegram.constants", "telegram.request"):
-        sys.modules.setdefault(name, mod)
+    mod = types.ModuleType("telegram")
+    ext_mod = types.ModuleType("telegram.ext")
+    constants_mod = types.ModuleType("telegram.constants")
+    request_mod = types.ModuleType("telegram.request")
+
+    class _FakeInlineKeyboardButton:
+        def __init__(self, text, callback_data=None, **kwargs):
+            self.text = text
+            self.callback_data = callback_data
+            self.kwargs = kwargs
+
+    class _FakeInlineKeyboardMarkup:
+        def __init__(self, inline_keyboard):
+            self.inline_keyboard = inline_keyboard
+
+    mod.Update = object
+    mod.Bot = object
+    mod.Message = object
+    mod.InlineKeyboardButton = _FakeInlineKeyboardButton
+    mod.InlineKeyboardMarkup = _FakeInlineKeyboardMarkup
+    constants_mod.ParseMode = SimpleNamespace(
+        MARKDOWN_V2="MarkdownV2",
+        MARKDOWN="Markdown",
+        HTML="HTML",
+    )
+    constants_mod.ChatType = SimpleNamespace(
+        GROUP="group",
+        SUPERGROUP="supergroup",
+        CHANNEL="channel",
+        PRIVATE="private",
+    )
+    ext_mod.Application = object
+    ext_mod.CommandHandler = object
+    ext_mod.CallbackQueryHandler = object
+    ext_mod.MessageHandler = object
+    ext_mod.TypeHandler = object
+    ext_mod.ContextTypes = SimpleNamespace(DEFAULT_TYPE=object)
+    ext_mod.filters = object
+    request_mod.HTTPXRequest = object
+
+    mod.ext = ext_mod
+    mod.constants = constants_mod
+    sys.modules["telegram"] = mod
+    sys.modules["telegram.ext"] = ext_mod
+    sys.modules["telegram.constants"] = constants_mod
+    sys.modules["telegram.request"] = request_mod
 
 
 _ensure_telegram_mock()

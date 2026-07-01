@@ -33,7 +33,7 @@ async def test_edit_overflow_split_reports_success_when_all_continuations_land(t
     )
 
     result = await telegram_adapter._edit_overflow_split(
-        "12345", "201", content, finalize=False, metadata={"thread_id": "77"}
+        "12345", "201", content, finalize=True, metadata={"thread_id": "77"}
     )
 
     assert result.success is True
@@ -59,7 +59,7 @@ async def test_edit_overflow_split_reports_later_partial_failure_after_some_cont
     )
 
     result = await telegram_adapter._edit_overflow_split(
-        "12345", "201", content, finalize=False, metadata={"thread_id": "77"}
+        "12345", "201", content, finalize=True, metadata={"thread_id": "77"}
     )
 
     assert result.success is False
@@ -80,7 +80,7 @@ async def test_edit_overflow_split_reports_partial_failure_when_continuation_fai
     )
 
     result = await telegram_adapter._edit_overflow_split(
-        "12345", "201", content, finalize=False, metadata={"thread_id": "77"}
+        "12345", "201", content, finalize=True, metadata={"thread_id": "77"}
     )
 
     assert result.success is False

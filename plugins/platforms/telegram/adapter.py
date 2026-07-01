@@ -8769,10 +8769,13 @@ class TelegramAdapter(BasePlatformAdapter):
         chat = message.chat
         user = message.from_user
         
-        # Determine chat type.  Normalize through ``str`` so tests/mocks and
+        # Normalize through ``str`` so tests/mocks and
         # python-telegram-bot enum values both work (``ChatType.CHANNEL`` is
-        # string-like, but mocks often provide plain strings).
-        telegram_chat_type = str(getattr(chat, "type", "")).split(".")[-1].lower()
+        # string-like, but mocks often provide plain strings). PTB ChatType values
+        # render as "supergroup"/"private" via their .value, while mocks may only
+        # provide a plain string.
+        chat_type_raw = getattr(chat, "type", "")
+        telegram_chat_type = str(getattr(chat_type_raw, "value", chat_type_raw)).split(".")[-1].lower()
         chat_type = "dm"
         if telegram_chat_type in {"group", "supergroup"}:
             chat_type = "group"

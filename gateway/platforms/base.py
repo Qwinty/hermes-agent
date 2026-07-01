@@ -1756,6 +1756,9 @@ class MessageEvent:
     reply_to_media_urls: List[str] = field(default_factory=list)
     reply_to_media_types: List[str] = field(default_factory=list)
 
+    # Forwarded-message metadata provided by adapters (Telegram forward_origin, etc.).
+    forward_origin: Optional[Dict[str, str]] = None
+
     # Optional session override for transports whose per-turn delivery id is
     # not the conversation id (e.g. Telegram Guest Bot guest_query_id).
     session_key_override: Optional[str] = None
@@ -1796,11 +1799,10 @@ class MessageEvent:
         """Check if this is a command message (e.g., /new, /reset)."""
         return self.text.startswith("/")
     
-    def get_command(self) -> Optional[str]:
-        """Extract command name if this is a command message."""
+    def _raw_command_token(self) -> Optional[str]:
+        """Return the normalized first slash-token without bot mention."""
         if not self.is_command():
             return None
-        # Split on space and get first word, strip the /
         parts = self.text.split(maxsplit=1)
         raw = parts[0][1:].lower() if parts else None
         if raw and "@" in raw:
@@ -1809,6 +1811,34 @@ class MessageEvent:
         if raw and "/" in raw:
             return None
         return raw
+
+    @staticmethod
+    def _compact_reasoning_arg(raw: Optional[str]) -> Optional[str]:
+        """Map compact Telegram commands like /reasoningmedium to args."""
+        if not raw or not raw.startswith("reasoning") or raw == "reasoning":
+            return None
+        suffix = raw[len("reasoning"):]
+        supported = {
+            "reset",
+            "none",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "show",
+            "hide",
+            "on",
+            "off",
+        }
+        return suffix if suffix in supported else None
+
+    def get_command(self) -> Optional[str]:
+        """Extract command name if this is a command message."""
+        raw = self._raw_command_token()
+        if self._compact_reasoning_arg(raw):
+            return "reasoning"
+        return raw
     
     def get_command_args(self) -> str:
         """Get the arguments after a command."""
@@ -1816,6 +1846,9 @@ class MessageEvent:
             return self.text
         parts = self.text.split(maxsplit=1)
         args = parts[1] if len(parts) > 1 else ""
+        compact_reasoning_arg = self._compact_reasoning_arg(self._raw_command_token())
+        if compact_reasoning_arg:
+            args = f"{compact_reasoning_arg} {args}".strip()
         # iOS auto-corrects -- to — (em dash) and - to – (en dash)
         args = args.replace("\u2014\u2014", "--").replace("\u2014", "--").replace("\u2013", "-")
         return args
@@ -2110,6 +2143,8 @@ def merge_pending_message_event(
             if incoming_has_media:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
+            if getattr(event, "forward_origin", None) and not getattr(existing, "forward_origin", None):
+                existing.forward_origin = event.forward_origin
             if event.text:
                 if existing.text:
                     existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
