@@ -117,6 +117,21 @@ def test_gateway_loads_persisted_runtime_overrides_on_startup():
     assert runner._session_reasoning_overrides[session_key] == {"enabled": True, "effort": "xhigh"}
 
 
+def test_gateway_loads_persisted_runtime_overrides_from_async_db_wrapper():
+    """Startup must use AsyncSessionDB._db sync methods, not coroutine wrappers."""
+    session_key = build_session_key(_make_source())
+    db = _FakeRuntimeOverrideDB()
+    db.model_overrides[session_key] = _model_override()
+    db.reasoning_overrides[session_key] = {"enabled": True, "effort": "high"}
+    async_wrapper = SimpleNamespace(_db=db)
+    runner = _make_runner(async_wrapper)
+
+    runner._load_persisted_session_runtime_overrides()
+
+    assert runner._session_model_overrides[session_key] == _model_override()
+    assert runner._session_reasoning_overrides[session_key] == {"enabled": True, "effort": "high"}
+
+
 @pytest.mark.asyncio
 async def test_text_model_switch_writes_session_override_through_to_db(monkeypatch):
     """`/model <name>` text path must persist the per-topic session override."""
