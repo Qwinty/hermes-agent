@@ -1799,6 +1799,16 @@ class MessageEvent:
         """Check if this is a command message (e.g., /new, /reset)."""
         return self.text.startswith("/")
     
+    @staticmethod
+    def _compact_reasoning_arg(raw_command: Optional[str]) -> Optional[str]:
+        """Return the reasoning level for compact commands like /reasoninghigh."""
+        if not raw_command or not raw_command.startswith("reasoning"):
+            return None
+        level = raw_command[len("reasoning"):]
+        if level in {"none", "minimal", "low", "medium", "high", "xhigh"}:
+            return level
+        return None
+
     def get_command(self) -> Optional[str]:
         """Extract command name if this is a command message."""
         if not self.is_command():
@@ -1811,6 +1821,8 @@ class MessageEvent:
         # Reject file paths: valid command names never contain /
         if raw and "/" in raw:
             return None
+        if self._compact_reasoning_arg(raw):
+            return "reasoning"
         return raw
     
     def get_command_args(self) -> str:
@@ -1818,7 +1830,12 @@ class MessageEvent:
         if not self.is_command():
             return self.text
         parts = self.text.split(maxsplit=1)
-        args = parts[1] if len(parts) > 1 else ""
+        raw = parts[0][1:].lower() if parts else ""
+        if "@" in raw:
+            raw = raw.split("@", 1)[0]
+        explicit_args = parts[1] if len(parts) > 1 else ""
+        compact_reasoning_arg = self._compact_reasoning_arg(raw)
+        args = f"{compact_reasoning_arg} {explicit_args}".strip() if compact_reasoning_arg else explicit_args
         # iOS auto-corrects -- to — (em dash) and - to – (en dash)
         args = args.replace("\u2014\u2014", "--").replace("\u2014", "--").replace("\u2013", "-")
         return args
