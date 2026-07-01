@@ -280,19 +280,20 @@ class TestGatewaySelfTargetingGuard:
 # ---------------------------------------------------------------------------
 
 class TestTerminalToolGatewayLifecycleGuard:
-    """terminal_tool must refuse gateway lifecycle commands when _HERMES_GATEWAY=1.
+    """terminal_tool must not blanket-block gateway lifecycle commands.
 
-    Issue #37453: systemctl --user restart hermes-gateway runs as a child of the
-    gateway process.  When systemd delivers SIGTERM the gateway kills its own
-    restart command mid-execution — the service may never restart.  The guard
-    must fire before execution, unconditionally (force=True cannot bypass it).
+    Gateway restart/recovery is handled by the gateway/systemd layers, while
+    risky shell commands are handled by the ordinary approval/security layer.
+    A terminal-level string guard caused false positives for legitimate remote
+    restarts of another Hermes instance.
     """
 
-    def _make_fake_env(self):
+    def _make_fake_env(self, calls):
         class _FakeEnv:
             env = {}
-            def execute(self, command, **kwargs):  # pragma: no cover
-                raise AssertionError("execute must not be reached")
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": "executed", "returncode": 0}
         return _FakeEnv()
 
     def _minimal_config(self):
@@ -317,67 +318,51 @@ class TestTerminalToolGatewayLifecycleGuard:
         "launchctl kickstart gui/501/ai.hermes.gateway",
         "pkill -f hermes.*gateway",
     ])
-    def test_blocks_lifecycle_commands_inside_gateway(self, monkeypatch, cmd):
+    def test_lifecycle_commands_inside_gateway_reach_backend(self, monkeypatch, cmd):
         import tools.terminal_tool as tt
-        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
+        calls = []
+        self._patch_env(monkeypatch, self._make_fake_env(calls), inside_gateway=True)
+        monkeypatch.setattr(tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True})
 
         result = json.loads(tt.terminal_tool(command=cmd))
 
-        assert result["exit_code"] == 1
-        assert "Blocked" in result["error"]
+        assert result["exit_code"] == 0
+        assert result["output"] == "executed"
+        assert calls == [cmd]
 
-    def test_force_true_cannot_bypass_block(self, monkeypatch):
+    def test_force_true_also_reaches_backend(self, monkeypatch):
         import tools.terminal_tool as tt
-        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
+        calls = []
+        self._patch_env(monkeypatch, self._make_fake_env(calls), inside_gateway=True)
 
         result = json.loads(tt.terminal_tool(
             command="systemctl restart hermes-gateway", force=True
         ))
 
-        assert result["exit_code"] == 1
-        assert "Blocked" in result["error"]
+        assert result["exit_code"] == 0
+        assert calls == ["systemctl restart hermes-gateway"]
 
-    def test_safe_hermes_gateway_restart_unsets_marker_and_passes_through(self, monkeypatch):
-        """Local override: `hermes gateway restart` is safe via SIGUSR1.
-
-        The child CLI would otherwise inherit _HERMES_GATEWAY=1 and refuse to
-        run. terminal_tool must strip that marker for this one safe command.
-        """
+    def test_hermes_gateway_restart_passes_through_unchanged(self, monkeypatch):
+        """terminal_tool no longer rewrites gateway restart commands."""
         import tools.terminal_tool as tt
-
         calls = []
-
-        class _FakeEnv:
-            env = {}
-            def execute(self, command, **kwargs):
-                calls.append(command)
-                return {"output": "restart requested", "returncode": 0}
-
-        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
-        monkeypatch.setattr(tt, "_check_all_guards", lambda cmd, env: {"approved": True})
+        self._patch_env(monkeypatch, self._make_fake_env(calls), inside_gateway=True)
+        monkeypatch.setattr(tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True})
 
         result = json.loads(tt.terminal_tool(command="hermes gateway restart"))
 
         assert result["exit_code"] == 0
-        assert calls == ["env -u _HERMES_GATEWAY hermes gateway restart"]
+        assert calls == ["hermes gateway restart"]
 
-    def test_safe_hermes_gateway_restart_force_true_also_passes_through(self, monkeypatch):
+    def test_hermes_gateway_restart_force_true_passes_through_unchanged(self, monkeypatch):
         import tools.terminal_tool as tt
-
         calls = []
-
-        class _FakeEnv:
-            env = {}
-            def execute(self, command, **kwargs):
-                calls.append(command)
-                return {"output": "restart requested", "returncode": 0}
-
-        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        self._patch_env(monkeypatch, self._make_fake_env(calls), inside_gateway=True)
 
         result = json.loads(tt.terminal_tool(command="hermes gateway restart", force=True))
 
         assert result["exit_code"] == 0
-        assert calls == ["env -u _HERMES_GATEWAY hermes gateway restart"]
+        assert calls == ["hermes gateway restart"]
 
     def test_safe_systemctl_commands_pass_through(self, monkeypatch):
         """Non-hermes systemctl commands must not be blocked by this guard."""
