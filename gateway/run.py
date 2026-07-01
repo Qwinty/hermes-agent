@@ -442,6 +442,7 @@ _GATEWAY_SYNTHETIC_FAILURE_PREFIXES = (
     "⚠️ Processing stopped:",
     "⚠️ Processing completed but no response was generated.",
     "Sorry, I encountered an error",
+    "Operation interrupted",
 )
 
 
@@ -7077,28 +7078,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.warning("Failed to enumerate resume-pending sessions: %s", exc)
             return 0
 
-        # Defense-3 (#30719): break the SIGTERM-respawn loop. Only count this
-        # boot when there are restart-interrupted sessions to resume — a clean
-        # boot must not accrue toward the breaker. If too many such boots have
-        # happened in the configured window, skip auto-resume for THIS boot:
-        # the gateway still comes up and serves real inbound messages, it just
-        # stops replaying the session that keeps killing it. The session stays
-        # resume_pending, so a real user message can still continue it (a human
-        # is now in the loop). Defenses 1-2 cover the cron/CLI/terminal paths;
-        # this catches every other SIGTERM source (e.g. a raw `terminal(
-        # "launchctl kickstart ai.hermes.gateway")`).
-        if candidates:
-            try:
-                from gateway import restart_loop_guard as _rlg
-
-                _max_restarts, _window = self._restart_loop_guard_config()
-                if _rlg.check_and_record(_max_restarts, _window):
-                    return 0
-            except Exception as exc:  # noqa: BLE001 — breaker must fail OPEN
-                logger.debug("Restart-loop guard check skipped: %s", exc)
-
         now = datetime.now()
-        scheduled = 0
+        ready: list[tuple[Any, Any, BasePlatformAdapter]] = []
         for entry in candidates:
             marker = entry.last_resume_marked_at or entry.updated_at
             if marker is not None and (now - marker).total_seconds() > window:
@@ -7171,7 +7152,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         exc_info=True,
                     )
                 continue
+            ready.append((entry, source, adapter))
 
+        # Defense-3 (#30719): break the SIGTERM-respawn loop. Count only boots
+        # with at least one session that really passed the transcript/tail
+        # eligibility checks above. Stale/empty/completed markers are cleanup
+        # bookkeeping, not auto-resume attempts; counting them can falsely trip
+        # the breaker and make a legitimate restart look like "work did not
+        # continue".
+        if ready:
+            try:
+                from gateway import restart_loop_guard as _rlg
+
+                _max_restarts, _window = self._restart_loop_guard_config()
+                if _rlg.check_and_record(_max_restarts, _window):
+                    return 0
+            except Exception as exc:  # noqa: BLE001 — breaker must fail OPEN
+                logger.debug("Restart-loop guard check skipped: %s", exc)
+
+        scheduled = 0
+        for entry, source, adapter in ready:
             # Claim the session slot *before* spawning the task so that an
             # inbound message arriving between task creation and the task's
             # first await (where _process_message_background sets the real
@@ -7282,7 +7282,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
             if role == "user" and msg.get("content"):
                 return saw_visible_assistant_since_user
-            if role == "assistant" and msg.get("content") and not msg.get("tool_calls"):
+            content = msg.get("content")
+            if (
+                role == "assistant"
+                and content
+                and not msg.get("tool_calls")
+                and not _looks_like_gateway_synthetic_failure(str(content))
+            ):
                 saw_visible_assistant_since_user = True
 
         for msg in messages or []:
@@ -7298,7 +7304,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # A real post-marker user turn supersedes this stale startup
                 # marker; do not classify it as an already-completed drain.
                 return False
-            if role == "assistant" and msg.get("content") and not msg.get("tool_calls"):
+            content = msg.get("content")
+            if (
+                role == "assistant"
+                and content
+                and not msg.get("tool_calls")
+                and not _looks_like_gateway_synthetic_failure(str(content))
+            ):
                 saw_visible_assistant_after_marker = True
         return saw_visible_assistant_since_user or saw_visible_assistant_after_marker
 

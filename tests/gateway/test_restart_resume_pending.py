@@ -1569,6 +1569,97 @@ async def test_startup_auto_resume_skips_completed_reply_after_marker():
 
 
 @pytest.mark.asyncio
+async def test_startup_auto_resume_keeps_synthetic_interruption_reply_after_marker():
+    """Gateway interruption text is not a completed assistant answer."""
+    runner, adapter = make_restart_runner()
+    marker = datetime.now()
+    source = make_restart_source(chat_id="synthetic-interrupt-chat")
+    session_key = "agent:main:telegram:dm:synthetic-interrupt-chat"
+    pending_entry = SessionEntry(
+        session_key=session_key,
+        session_id="sid",
+        created_at=marker - timedelta(seconds=10),
+        updated_at=marker,
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=marker,
+    )
+    runner.session_store._entries = {session_key: pending_entry}
+    runner._session_db = MagicMock()
+    runner._session_db.get_telegram_topic_binding.return_value = None
+    runner._session_db.message_count.return_value = 2
+    runner._session_db.get_messages.return_value = [
+        {
+            "role": "user",
+            "content": "please keep working",
+            "timestamp": (marker - timedelta(seconds=5)).timestamp(),
+        },
+        {
+            "role": "assistant",
+            "content": "Operation interrupted: waiting for model response (0.9s elapsed).",
+            "timestamp": (marker + timedelta(seconds=1)).timestamp(),
+        },
+    ]
+    adapter.handle_message = AsyncMock()
+
+    scheduled = runner._schedule_resume_pending_sessions()
+    await asyncio.sleep(0)
+
+    assert scheduled == 1
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_startup_auto_resume_does_not_count_completed_markers_as_loop_boots():
+    """Completed/stale markers are cleanup, not restart-loop attempts."""
+    runner, adapter = make_restart_runner()
+    marker = datetime.now()
+    source = make_restart_source(chat_id="done-loop-chat")
+    session_key = "agent:main:telegram:dm:done-loop-chat"
+    pending_entry = SessionEntry(
+        session_key=session_key,
+        session_id="sid",
+        created_at=marker - timedelta(seconds=10),
+        updated_at=marker,
+        origin=source,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=marker,
+    )
+    runner.session_store._entries = {session_key: pending_entry}
+    runner.session_store.clear_resume_pending = MagicMock(return_value=True)
+    runner._session_db = MagicMock()
+    runner._session_db.get_telegram_topic_binding.return_value = None
+    runner._session_db.message_count.return_value = 2
+    runner._session_db.get_messages.return_value = [
+        {
+            "role": "user",
+            "content": "question",
+            "timestamp": (marker - timedelta(seconds=5)).timestamp(),
+        },
+        {
+            "role": "assistant",
+            "content": "completed answer",
+            "timestamp": (marker + timedelta(seconds=1)).timestamp(),
+        },
+    ]
+    adapter.handle_message = AsyncMock()
+
+    with patch("gateway.restart_loop_guard.check_and_record") as check_and_record:
+        scheduled = runner._schedule_resume_pending_sessions()
+
+    assert scheduled == 0
+    check_and_record.assert_not_called()
+    runner.session_store.clear_resume_pending.assert_called_once_with(session_key)
+    adapter.handle_message.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_startup_auto_resume_keeps_unfinished_tool_tail_after_marker():
     """A post-marker interrupted tool tail is still eligible for recovery."""
     runner, adapter = make_restart_runner()
