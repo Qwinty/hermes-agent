@@ -4777,8 +4777,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._session_model_overrides = {}
         if not hasattr(self, "_session_reasoning_overrides"):
             self._session_reasoning_overrides = {}
+        # Gateway startup runs before the event loop is serving traffic.  The
+        # normal gateway store is AsyncSessionDB, whose dynamic wrappers return
+        # coroutines; use the underlying sync SessionDB here to avoid leaking
+        # un-awaited coroutines during construction.
+        sync_session_db = getattr(session_db, "_db", session_db)
         try:
-            model_overrides = session_db.get_gateway_session_model_overrides()
+            model_overrides = sync_session_db.get_gateway_session_model_overrides()
             if isinstance(model_overrides, dict):
                 self._session_model_overrides.update(
                     {
@@ -4790,7 +4795,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as exc:
             logger.warning("Failed to load persisted model overrides: %s", exc)
         try:
-            reasoning_overrides = session_db.get_gateway_session_reasoning_overrides()
+            reasoning_overrides = sync_session_db.get_gateway_session_reasoning_overrides()
             if isinstance(reasoning_overrides, dict):
                 self._session_reasoning_overrides.update(
                     {
