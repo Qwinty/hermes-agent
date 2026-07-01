@@ -5,6 +5,7 @@ Covers the threading behavior control for multi-chunk replies:
 - "first": Only first chunk threads (default)
 - "all": All chunks thread to original message
 """
+import importlib
 import os
 import sys
 import types
@@ -18,8 +19,27 @@ from gateway.config import PlatformConfig, GatewayConfig, Platform, _apply_env_o
 
 def _ensure_telegram_mock():
     """Mock the telegram package if it's not installed."""
-    if "telegram" in sys.modules and hasattr(sys.modules["telegram"], "__file__"):
+    def _real_telegram_available() -> bool:
+        try:
+            importlib.import_module("telegram")
+            importlib.import_module("telegram.ext")
+            constants = importlib.import_module("telegram.constants")
+            importlib.import_module("telegram.request")
+        except ImportError:
+            return False
+        chat_type = getattr(constants, "ChatType", None)
+        supergroup = getattr(chat_type, "SUPERGROUP", None)
+        supergroup_value = getattr(supergroup, "value", supergroup)
+        return str(supergroup_value).split(".")[-1].lower() == "supergroup"
+
+    if _real_telegram_available():
         return
+
+    for name in ("telegram", "telegram.ext", "telegram.constants", "telegram.request"):
+        sys.modules.pop(name, None)
+    if _real_telegram_available():
+        return
+
     mod = types.ModuleType("telegram")
     ext_mod = types.ModuleType("telegram.ext")
     constants_mod = types.ModuleType("telegram.constants")
