@@ -5366,7 +5366,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         has_startup_media_pending = self._adapter_declared_method(adapter, "has_startup_media_pending")
 
         while True:
-            incoming = self._pop_adapter_pending_image_event(adapter, session_key)
+            incoming = self._pop_adapter_pending_startup_event(adapter, session_key)
             if incoming is None and pop_startup_media_event is not None:
                 try:
                     incoming = pop_startup_media_event(session_key)
@@ -5375,7 +5375,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     incoming = None
 
             if incoming is not None:
-                if self._event_has_forwarded_text_context(incoming):
+                if self._event_has_forwarded_text_context(incoming) and not getattr(incoming, "media_urls", None):
                     incoming = self._inline_forward_context_for_text_followup(incoming)
                     merged_text_batches += 1
                 slot = {session_key: event}
@@ -10737,6 +10737,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"{message_text}"
                 )
 
+        if getattr(event, "forward_origin", None):
+            forward_context = self._format_forward_origin_context(event.forward_origin)
+            if forward_context and not (message_text or "").lstrip().startswith("[Forwarded message |"):
+                message_text = f"{forward_context}\n\n{message_text}" if message_text else forward_context
+
         if getattr(event, "reply_to_media_urls", None):
             reply_image_paths: list[str] = []
             reply_audio_paths: list[str] = []
@@ -10767,10 +10772,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 reply_context_parts.append(image_context)
             if reply_audio_paths:
-                audio_context, _ = await self._enrich_message_with_transcription(
+                _audio_enriched = await self._enrich_message_with_transcription(
                     "[The user replied to a message that contains voice/audio.]",
                     reply_audio_paths,
                 )
+                if isinstance(_audio_enriched, tuple):
+                    audio_context = _audio_enriched[0]
+                else:
+                    audio_context = _audio_enriched
                 audio_context = audio_context.replace(
                     "[The user sent a voice message~",
                     "[The message the user replied to contains a voice message~",
@@ -13792,7 +13801,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         title: str,
     ) -> None:
         """Best-effort rename of a Telegram DM topic when Hermes titles a session."""
-        if not await asyncio.to_thread(self._is_telegram_topic_lane, source) or not source.chat_id or not source.thread_id:
+        if not self._is_telegram_topic_lane(source) or not source.chat_id or not source.thread_id:
             return
 
         # Operator can fully disable per-topic auto-rename via

@@ -81,6 +81,18 @@ class TestReasoningCommand:
         source = inspect.getsource(gateway_run.GatewayRunner._handle_message)
         assert '"reasoning"' in source
 
+    def test_compact_reasoning_level_commands_are_resolved_as_reasoning(self):
+        event = _make_event("/reasoningmedium")
+
+        assert event.get_command() == "reasoning"
+        assert event.get_command_args() == "medium"
+
+    def test_compact_reasoning_level_commands_strip_bot_mention(self):
+        event = _make_event("/reasoninghigh@LynxBot")
+
+        assert event.get_command() == "reasoning"
+        assert event.get_command_args() == "high"
+
     def test_parse_reasoning_command_args_accepts_ascii_and_smart_global_flags(self):
         assert gateway_run.GatewayRunner._parse_reasoning_command_args("high --global") == ("high", True)
         assert gateway_run.GatewayRunner._parse_reasoning_command_args("—global xhigh") == ("xhigh", True)
