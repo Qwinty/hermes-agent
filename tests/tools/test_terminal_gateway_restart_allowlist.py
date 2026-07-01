@@ -1,84 +1,75 @@
-"""Tests for the local gateway-restart allowlist in terminal_tool.
+"""Tests for gateway lifecycle handling in terminal_tool.
 
-The upstream hard-block (commit 245b95b09) rejects all gateway lifecycle
-commands when ``_HERMES_GATEWAY=1``. Our local override exempts
-``hermes gateway restart`` because it uses SIGUSR1 graceful drain (not
-SIGTERM), so child processes survive.
+Terminal tool must not blanket-block gateway lifecycle commands. The gateway
+already has graceful restart/recovery behavior, and ordinary approval checks are
+the right layer for risky shell commands.
 """
 
-from tools.terminal_tool import (
-    _gateway_restart_command_for_child,
-    _is_safe_gateway_restart_only,
-)
+import json
+
+from tools import terminal_tool as tt
 
 
-class TestIsSafeGatewayRestartOnly:
-    def test_plain_restart_allowed(self):
-        assert _is_safe_gateway_restart_only("hermes gateway restart")
+class _FakeEnv:
+    def __init__(self):
+        self.cwd = "/tmp"
+        self.calls = []
 
-    def test_blocks_restart_flags_inside_gateway(self):
-        assert not _is_safe_gateway_restart_only("hermes gateway restart --system")
-        assert not _is_safe_gateway_restart_only("hermes gateway restart --all")
-        assert not _is_safe_gateway_restart_only("hermes gateway restart --foo=bar")
+    def is_alive(self):
+        return True
 
-    def test_blocks_shell_substitution_in_flag_value(self):
-        assert not _is_safe_gateway_restart_only("hermes gateway restart --x=$(id)")
-        assert not _is_safe_gateway_restart_only("hermes gateway restart --x=`id`")
-        assert not _is_safe_gateway_restart_only(
-            "hermes gateway restart --x=$(pkill${IFS}-f${IFS}hermes-gateway)"
+    def execute(self, command, timeout=None, cwd=None, **kwargs):
+        self.calls.append(
+            {
+                "command": command,
+                "timeout": timeout,
+                "cwd": cwd,
+                "kwargs": kwargs,
+            }
         )
-        assert not _is_safe_gateway_restart_only("hermes gateway restart --x=<(id)")
-        assert not _is_safe_gateway_restart_only("hermes gateway restart --x=>/tmp/pwn")
+        return {"output": "ran", "returncode": 0}
 
-    def test_blocks_newline_separated_tokens(self):
-        assert not _is_safe_gateway_restart_only("hermes\ngateway\nrestart")
-        assert not _is_safe_gateway_restart_only("hermes gateway restart\n--all")
 
-    def test_blocks_uppercase_command(self):
-        assert not _is_safe_gateway_restart_only("HERMES GATEWAY RESTART")
+def test_gateway_lifecycle_command_reaches_terminal_backend(monkeypatch):
+    """Even inside gateway, terminal_tool should not hard-block lifecycle text."""
+    fake_env = _FakeEnv()
+    monkeypatch.setenv("_HERMES_GATEWAY", "1")
+    monkeypatch.setattr(tt, "_get_env_config", lambda: {"env_type": "local", "cwd": "/tmp", "timeout": 30, "local_persistent": True})
+    monkeypatch.setattr(tt, "_resolve_container_task_id", lambda task_id: "default")
+    monkeypatch.setattr(tt, "resolve_task_overrides", lambda task_id: {})
+    monkeypatch.setattr(tt, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(tt, "_check_all_guards", lambda *args, **kwargs: {"approved": True})
+    monkeypatch.setattr(tt, "_active_environments", {"default": fake_env})
+    monkeypatch.setattr(tt, "_last_activity", {})
 
-    def test_restart_double_spaces_allowed(self):
-        assert _is_safe_gateway_restart_only("hermes  gateway  restart")
-
-    def test_systemctl_restart_blocked(self):
-        assert not _is_safe_gateway_restart_only(
-            "systemctl --user restart hermes-gateway"
+    result = json.loads(
+        tt.terminal_tool(
+            command="systemctl --user restart hermes-gateway",
+            timeout=5,
+            force=True,
         )
+    )
 
-    def test_pkill_blocked(self):
-        assert not _is_safe_gateway_restart_only("pkill -f hermes.*gateway")
+    assert result["exit_code"] == 0
+    assert result["output"] == "ran"
+    assert fake_env.calls[0]["command"] == "systemctl --user restart hermes-gateway"
+    assert "Blocked: cannot restart" not in (result.get("error") or "")
 
-    def test_hermes_gateway_stop_blocked(self):
-        assert not _is_safe_gateway_restart_only("hermes gateway stop")
 
-    def test_hermes_gateway_start_blocked(self):
-        assert not _is_safe_gateway_restart_only("hermes gateway start")
+def test_gateway_marker_is_not_rewritten_for_hermes_gateway_restart(monkeypatch):
+    """terminal_tool should pass the requested command through unchanged."""
+    fake_env = _FakeEnv()
+    monkeypatch.setenv("_HERMES_GATEWAY", "1")
+    monkeypatch.setattr(tt, "_get_env_config", lambda: {"env_type": "local", "cwd": "/tmp", "timeout": 30, "local_persistent": True})
+    monkeypatch.setattr(tt, "_resolve_container_task_id", lambda task_id: "default")
+    monkeypatch.setattr(tt, "resolve_task_overrides", lambda task_id: {})
+    monkeypatch.setattr(tt, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(tt, "_check_all_guards", lambda *args, **kwargs: {"approved": True})
+    monkeypatch.setattr(tt, "_active_environments", {"default": fake_env})
+    monkeypatch.setattr(tt, "_last_activity", {})
 
-    def test_restart_combined_with_systemctl_blocked(self):
-        assert not _is_safe_gateway_restart_only(
-            "hermes gateway restart && systemctl restart hermes-gateway"
-        )
+    result = json.loads(tt.terminal_tool(command="hermes gateway restart", timeout=5, force=True))
 
-    def test_restart_combined_with_pkill_blocked(self):
-        assert not _is_safe_gateway_restart_only(
-            "pkill -f hermes-gateway; hermes gateway restart"
-        )
-
-    def test_env_wrapper_blocked(self):
-        assert not _is_safe_gateway_restart_only(
-            "env -u _HERMES_GATEWAY hermes gateway restart"
-        )
-
-    def test_pipe_blocked(self):
-        assert not _is_safe_gateway_restart_only("hermes gateway restart | cat")
-
-    def test_non_lifecycle_command_returns_false(self):
-        assert not _is_safe_gateway_restart_only("ls -la")
-
-    def test_empty_command_returns_false(self):
-        assert not _is_safe_gateway_restart_only("")
-
-    def test_child_command_unsets_gateway_marker(self):
-        assert _gateway_restart_command_for_child("hermes gateway restart") == (
-            "env -u _HERMES_GATEWAY hermes gateway restart"
-        )
+    assert result["exit_code"] == 0
+    assert fake_env.calls[0]["command"] == "hermes gateway restart"
+    assert not fake_env.calls[0]["command"].startswith("env -u _HERMES_GATEWAY")
