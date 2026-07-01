@@ -77,69 +77,6 @@ from tools.tool_backend_helpers import (
 )
 
 
-# ---------------------------------------------------------------------------
-# Gateway lifecycle allowlist — local override
-# ---------------------------------------------------------------------------
-# `hermes gateway restart` uses SIGUSR1 graceful drain (not SIGTERM), so
-# child processes — including terminal-tool subprocesses spawned from inside
-# the gateway — survive the restart cycle. This makes it safe to run from
-# inside the gateway, unlike `systemctl restart`, `pkill`, or
-# `hermes gateway stop`, which SIGTERM the cgroup and kill mid-flight work.
-#
-# The allowlist is narrow: only `hermes gateway restart` (with optional
-# flags like --system, --all) is permitted. Any other lifecycle command in
-# the same string (systemctl, pkill, launchctl, hermes gateway stop) makes
-# the whole command unsafe and it stays blocked.
-
-_SAFE_GATEWAY_RESTART_ARGV = ("hermes", "gateway", "restart")
-
-
-def _safe_gateway_restart_argv(command: str) -> list[str] | None:
-    """Return argv when *command* is exactly ``hermes gateway restart``.
-
-    The terminal backend executes shell strings, so do not validate lifecycle
-    exceptions with regexes over shell syntax. Command substitutions, redirects,
-    newlines, and env wrappers can all execute before ``env -u`` gets a chance
-    to remove ``_HERMES_GATEWAY``. Parse as argv and allow only the minimal safe
-    restart form.
-    """
-    if not command or "\n" in command or "\r" in command:
-        return None
-    try:
-        argv = shlex.split(command, posix=True)
-    except ValueError:
-        return None
-    if tuple(argv) != _SAFE_GATEWAY_RESTART_ARGV:
-        return None
-    return argv
-
-
-def _is_safe_gateway_restart_only(command: str) -> bool:
-    """Return True for a standalone safe ``hermes gateway restart`` command.
-
-    ``hermes gateway restart`` uses SIGUSR1 graceful drain — child processes
-    survive. Keep this intentionally narrow: flags, shell chains, pipes, env
-    wrappers, redirects, and other lifecycle commands stay blocked so a mixed
-    command cannot smuggle unsafe work through the allowlist.
-    """
-    return _safe_gateway_restart_argv(command) is not None
-
-
-def _gateway_restart_command_for_child(command: str) -> str:
-    """Run the safe restart as a non-gateway child process.
-
-    The terminal tool itself runs inside the gateway and therefore has
-    ``_HERMES_GATEWAY=1``. The child ``hermes gateway restart`` CLI also checks
-    that marker and would refuse to run unless we explicitly remove it for this
-    one safe command. Build the shell command from validated argv with
-    ``shlex.join`` rather than embedding raw user text.
-    """
-    argv = _safe_gateway_restart_argv(command)
-    if argv is None:
-        raise ValueError("not a safe gateway restart command")
-    return shlex.join(["env", "-u", "_HERMES_GATEWAY", *argv])
-
-
 def _safe_parse_import_env(
     name: str,
     default: Any,
@@ -2311,36 +2248,11 @@ def terminal_tool(
                         env = new_env
                     logger.info("%s environment ready for task %s", env_type, effective_task_id[:8])
 
-        # Hard-block: gateway lifecycle commands (systemctl/launchctl/hermes
-        # restart|stop targeting hermes-gateway) must never run inside the
-        # gateway process itself. The restart would SIGTERM the gateway, which
-        # kills this very subprocess before it can complete — the service may
-        # never restart. This mirrors the `hermes gateway restart` guard in
-        # hermes_cli/gateway.py and the cron-path guard in hermes_cli/cron.py,
-        # but applies unconditionally (force=True cannot help here).
-        #
-        # Local override: `hermes gateway restart` is exempted because it uses
-        # SIGUSR1 graceful drain (not SIGTERM) — child processes survive the
-        # restart cycle. Other lifecycle commands (systemctl, pkill,
-        # hermes gateway stop) still kill the process tree and remain blocked.
-        if os.environ.get("_HERMES_GATEWAY") == "1":
-            from hermes_cli.cron import _contains_gateway_lifecycle_command
-            if _contains_gateway_lifecycle_command(command):
-                if _is_safe_gateway_restart_only(command):
-                    command = _gateway_restart_command_for_child(command)
-                else:
-                    return json.dumps({
-                        "output": "",
-                        "exit_code": 1,
-                        "error": (
-                            "Blocked: cannot restart or stop the gateway from inside the "
-                            "gateway process. The gateway would kill this command before "
-                            "it could complete (SIGTERM propagates to child processes). "
-                            "Run `hermes gateway restart` from a separate shell outside "
-                            "the running gateway, or use the /restart slash command."
-                        ),
-                        "status": "error",
-                    }, ensure_ascii=False)
+        # Gateway lifecycle commands intentionally flow through the ordinary
+        # approval/security layer below. The gateway has drain/recovery paths for
+        # restarts, and a terminal-level string guard caused false positives for
+        # legitimate operations such as remote SSH restarts of another Hermes
+        # instance.
 
         # Pre-exec security checks (tirith + dangerous command detection)
         # Skip check if force=True (user has confirmed they want to run it)
