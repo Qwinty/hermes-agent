@@ -5100,9 +5100,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return guest_reasoning
         return self._load_reasoning_config()
 
+    def _sync_session_db(self):
+        """Return the underlying synchronous SessionDB when _session_db is async.
+
+        Some gateway startup/shutdown helpers are intentionally synchronous and
+        run before the serving loop can await AsyncSessionDB wrappers. Those
+        paths must call the wrapped SessionDB directly instead of leaking
+        coroutine objects.
+        """
+        session_db = getattr(self, "_session_db", None)
+        if session_db is None:
+            return None
+        wrapped = getattr(session_db, "__dict__", {}).get("_db")
+        return wrapped if wrapped is not None else session_db
+
     def _load_persisted_session_runtime_overrides(self) -> None:
         """Restore gateway session-scoped model/reasoning overrides from state.db."""
-        session_db = getattr(self, "_session_db", None)
+        session_db = self._sync_session_db()
         if session_db is None:
             return
         if not hasattr(self, "_session_model_overrides"):
@@ -5146,7 +5160,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._session_model_overrides = {}
         override = dict(model_override)
         self._session_model_overrides[session_key] = override
-        session_db = getattr(self, "_session_db", None)
+        session_db = self._sync_session_db()
         if session_db is None:
             return
         try:
@@ -5164,7 +5178,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
         if not hasattr(self, "_session_reasoning_overrides"):
             self._session_reasoning_overrides = {}
-        session_db = getattr(self, "_session_db", None)
+        session_db = self._sync_session_db()
         if reasoning_config is None:
             self._session_reasoning_overrides.pop(session_key, None)
             if session_db is not None:
@@ -5191,7 +5205,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._session_reasoning_overrides = {}
         self._session_model_overrides.pop(session_key, None)
         self._session_reasoning_overrides.pop(session_key, None)
-        session_db = getattr(self, "_session_db", None)
+        session_db = self._sync_session_db()
         if session_db is None:
             return
         try:
@@ -7240,7 +7254,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         the model repeats the just-delivered answer and replies to an old topic
         anchor.
         """
-        session_db = getattr(self, "_session_db", None)
+        session_db = self._sync_session_db()
         if session_db is None or not session_id:
             return False
         marker = _coerce_gateway_timestamp(
@@ -7292,7 +7306,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Return the transcript session id an auto-resume would actually use."""
         session_id = str(getattr(entry, "session_id", "") or "")
         source = getattr(entry, "origin", None)
-        session_db = getattr(self, "_session_db", None)
+        session_db = self._sync_session_db()
         if (
             source is not None
             and session_db is not None
@@ -7317,7 +7331,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """True when there is persisted conversation state worth auto-resuming."""
         if not session_id:
             return False
-        session_db = getattr(self, "_session_db", None)
+        session_db = self._sync_session_db()
         if session_db is None:
             return True
         try:
