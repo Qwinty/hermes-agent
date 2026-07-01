@@ -225,6 +225,24 @@ def test_observed_group_context_uses_shared_source_and_prompt_for_later_mentions
     asyncio.run(_run())
 
 
+def test_clean_bot_trigger_text_preserves_command_args_after_bot_suffix():
+    adapter = _make_adapter(bot_username="LynxBot")
+
+    assert adapter._clean_bot_trigger_text("/reasoning@LynxBot medium") == "/reasoning medium"
+
+
+def test_clean_bot_trigger_text_preserves_command_args_after_bot_suffix_with_punctuation():
+    adapter = _make_adapter(bot_username="LynxBot")
+
+    assert adapter._clean_bot_trigger_text("/reasoning@LynxBot: high --global") == "/reasoning high --global"
+
+
+def test_clean_bot_trigger_text_keeps_bare_command_suffix_compact():
+    adapter = _make_adapter(bot_username="LynxBot")
+
+    assert adapter._clean_bot_trigger_text("/new@LynxBot") == "/new"
+
+
 def test_observed_group_context_replays_as_current_message_context_not_user_turns():
     from gateway.run import (
         _build_gateway_agent_history,
