@@ -36,6 +36,50 @@ def test_cliproxyapi_preserves_xhigh_for_gpt_chat_completions():
     assert kwargs["reasoning_effort"] == "xhigh"
 
 
+def test_cliproxyapi_clamps_max_to_xhigh_for_gpt_chat_completions():
+    kwargs = _kwargs_for("gpt-5.5", "max")
+
+    assert kwargs["reasoning_effort"] == "xhigh"
+
+
+def test_cliproxyapi_claude_family_slug_emits_reasoning_effort():
+    kwargs = _kwargs_for("neko-sonnet-5", "xhigh")
+
+    assert kwargs["reasoning_effort"] == "xhigh"
+    assert "extra_body" not in kwargs
+
+
+def test_cliproxyapi_claude_family_slug_preserves_max_reasoning_effort():
+    kwargs = _kwargs_for("neko-opus-4.8", "max")
+
+    assert kwargs["reasoning_effort"] == "max"
+
+
+def test_cliproxyapi_claude_family_slug_reasoning_none_disables_thinking():
+    kwargs = _kwargs_for("neko-fable-5", "none")
+
+    assert kwargs["reasoning_effort"] == "none"
+
+
+def test_cliproxyapi_claude_family_matching_is_not_tied_to_neko_prefix():
+    kwargs = _kwargs_for("sonnet-4.6", "high")
+
+    assert kwargs["reasoning_effort"] == "high"
+
+
+def test_cliproxyapi_claude_family_matching_handles_provider_prefixed_alias():
+    kwargs = _kwargs_for("some-provider/opus-4-8", "max")
+
+    assert kwargs["reasoning_effort"] == "max"
+
+
+def test_cliproxyapi_neko_prefix_alone_does_not_emit_reasoning_effort():
+    kwargs = _kwargs_for("neko-random-model", "high")
+
+    assert "reasoning_effort" not in kwargs
+    assert "extra_body" not in kwargs
+
+
 def test_cliproxyapi_does_not_emit_reasoning_effort_for_gemini_slug():
     kwargs = _kwargs_for("gemini-3.1-pro-high", "high")
 
