@@ -160,12 +160,23 @@ def _xai_curated_models() -> list[str]:
     Mirrors ``_codex_curated_models()``'s role for openai-codex.
     """
     try:
-        from agent.models_dev import _load_disk_cache
+        from agent.models_dev import _NOISE_PATTERNS, _load_disk_cache
+
         data = _load_disk_cache()
         xai = data.get("xai") if isinstance(data, dict) else None
         models = xai.get("models") if isinstance(xai, dict) else None
         if isinstance(models, dict) and models:
-            ids = [mid for mid in models.keys() if isinstance(mid, str)]
+            ids: list[str] = []
+            for mid, entry in models.items():
+                if not isinstance(mid, str) or not isinstance(entry, dict):
+                    continue
+                # Keep this path import-time safe: mirror list_agentic_models()
+                # without importing hermes_cli.models back from models_dev.
+                if not entry.get("tool_call", False):
+                    continue
+                if _NOISE_PATTERNS.search(mid):
+                    continue
+                ids.append(mid)
             if ids:
                 return _xai_merge_curated_extras(_xai_promote_top(sorted(ids)))
     except Exception:
@@ -2794,6 +2805,183 @@ def copilot_default_headers() -> dict[str, str]:
         }
 
 
+_NON_TEXT_MODEL_ID_TOKENS = (
+    "embedding",
+    "embeddings",
+    "moderation",
+    "rerank",
+    "deepgram",
+    "whisper",
+    "audio",
+    "speech",
+    "transcribe",
+    "transcription",
+    "tts",
+    "imagine",
+    "video",
+    "gpt-image",
+    "dall-e",
+)
+
+_NON_PICKER_MODEL_ID_TOKENS = (
+    "auto-review",
+)
+
+
+def _normalized_string_list(value: Any) -> Optional[list[str]]:
+    if not isinstance(value, list):
+        return None
+    return [str(item).strip().lower() for item in value if str(item).strip()]
+
+
+def _catalog_entry_id(entry: Any) -> str:
+    if isinstance(entry, str):
+        return entry.strip()
+    if isinstance(entry, dict):
+        model_id = entry.get("id") or entry.get("model") or entry.get("name")
+        if isinstance(model_id, str):
+            return model_id.strip()
+    return ""
+
+
+def _model_id_looks_like_image_generation(model_id: str) -> bool:
+    normalized = model_id.lower()
+    leaf = normalized.rsplit("/", 1)[-1]
+    return (
+        leaf.endswith("-image")
+        or leaf.endswith("-images")
+        or "-image-preview" in leaf
+        or leaf.startswith("gpt-image")
+        or leaf.startswith("dall-e")
+    )
+
+
+def is_non_text_model_id(model_id: str) -> bool:
+    """Return True when a model ID is clearly not a text/chat model.
+
+    This is a conservative string-only fallback used at picker boundaries where
+    richer catalog metadata (modalities, endpoint support, model type) has
+    already been lost. Prefer ``_filter_model_catalog_entries`` when full
+    ``/models`` entries are available.
+    """
+    normalized = str(model_id or "").strip().lower()
+    if not normalized:
+        return False
+    if _model_id_looks_like_image_generation(normalized):
+        return True
+    leaf = normalized.rsplit("/", 1)[-1]
+    if any(token in leaf for token in _NON_TEXT_MODEL_ID_TOKENS):
+        return True
+    if any(token in leaf for token in _NON_PICKER_MODEL_ID_TOKENS):
+        return True
+    try:
+        from agent.models_dev import _NOISE_PATTERNS
+
+        return bool(_NOISE_PATTERNS.search(normalized))
+    except Exception:
+        return False
+
+
+def _model_catalog_entry_is_text_chat(entry: dict[str, Any]) -> bool:
+    model_id = _catalog_entry_id(entry)
+    if not model_id:
+        return False
+    if is_non_text_model_id(model_id):
+        return False
+
+    input_modalities = _normalized_string_list(entry.get("input_modalities"))
+    output_modalities = _normalized_string_list(entry.get("output_modalities"))
+    if input_modalities is None or output_modalities is None:
+        modalities = entry.get("modalities")
+        if isinstance(modalities, dict):
+            if input_modalities is None:
+                input_modalities = _normalized_string_list(modalities.get("input"))
+            if output_modalities is None:
+                output_modalities = _normalized_string_list(modalities.get("output"))
+
+    if output_modalities is not None:
+        if "text" not in output_modalities:
+            return False
+        if input_modalities is not None and "text" not in input_modalities:
+            return False
+        return True
+    if input_modalities is not None and "text" not in input_modalities:
+        return False
+
+    model_type = str(entry.get("type") or "").strip().lower()
+    if model_type in {
+        "audio",
+        "embedding",
+        "image",
+        "moderation",
+        "rerank",
+        "speech",
+        "transcription",
+        "tts",
+        "video",
+    }:
+        return False
+
+    capabilities = entry.get("capabilities")
+    if isinstance(capabilities, dict):
+        capability_type = str(capabilities.get("type") or "").strip().lower()
+        if capability_type and capability_type not in {"chat", "completion", "responses", "text"}:
+            return False
+
+    supported_endpoints = entry.get("supported_endpoints")
+    if isinstance(supported_endpoints, list):
+        endpoints = {
+            str(endpoint).strip()
+            for endpoint in supported_endpoints
+            if str(endpoint).strip()
+        }
+        if endpoints and not endpoints.intersection(
+            {"/chat/completions", "/responses", "/v1/messages"}
+        ):
+            return False
+
+    haystack = " ".join(
+        str(entry.get(key) or "")
+        for key in ("id", "owned_by", "root", "name", "subtype")
+    ).lower()
+    if any(token in haystack for token in _NON_TEXT_MODEL_ID_TOKENS):
+        return False
+    if any(token in haystack for token in _NON_PICKER_MODEL_ID_TOKENS):
+        return False
+    return True
+
+
+def _filter_model_catalog_entries(entries: Any) -> list[str]:
+    if not isinstance(entries, list):
+        return []
+
+    ids_in_catalog = {
+        _catalog_entry_id(entry)
+        for entry in entries
+        if _catalog_entry_id(entry)
+    }
+    models: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        model_id = _catalog_entry_id(entry)
+        if not model_id:
+            continue
+        if isinstance(entry, dict):
+            parent = str(entry.get("parent") or "").strip()
+            if parent and parent in ids_in_catalog:
+                continue
+            if not _model_catalog_entry_is_text_chat(entry):
+                continue
+        elif is_non_text_model_id(model_id):
+            continue
+        dedup_key = model_id.lower()
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+        models.append(model_id)
+    return models
+
+
 def _copilot_catalog_item_is_text_model(item: dict[str, Any]) -> bool:
     model_id = str(item.get("id") or "").strip()
     if not model_id:
@@ -2802,25 +2990,7 @@ def _copilot_catalog_item_is_text_model(item: dict[str, Any]) -> bool:
     if item.get("model_picker_enabled") is False:
         return False
 
-    capabilities = item.get("capabilities")
-    if isinstance(capabilities, dict):
-        model_type = str(capabilities.get("type") or "").strip().lower()
-        if model_type and model_type != "chat":
-            return False
-
-    supported_endpoints = item.get("supported_endpoints")
-    if isinstance(supported_endpoints, list):
-        normalized_endpoints = {
-            str(endpoint).strip()
-            for endpoint in supported_endpoints
-            if str(endpoint).strip()
-        }
-        if normalized_endpoints and not normalized_endpoints.intersection(
-            {"/chat/completions", "/responses", "/v1/messages"}
-        ):
-            return False
-
-    return True
+    return _model_catalog_entry_is_text_chat(item)
 
 
 def fetch_github_model_catalog(
@@ -3508,8 +3678,9 @@ def probe_api_models(
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read().decode())
+                entries = data.get("data", []) if isinstance(data, dict) else []
                 return {
-                    "models": [m.get("id", "") for m in data.get("data", [])],
+                    "models": _filter_model_catalog_entries(entries),
                     "probed_url": url,
                     "resolved_base_url": candidate_base.rstrip("/"),
                     "suggested_base_url": alternate_base if alternate_base != candidate_base else normalized,

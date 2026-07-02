@@ -211,7 +211,9 @@ class ProviderProfile:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read().decode())
             items = data if isinstance(data, list) else data.get("data", [])
-            return [m["id"] for m in items if isinstance(m, dict) and "id" in m]
+            from hermes_cli.models import _filter_model_catalog_entries
+
+            return _filter_model_catalog_entries(items)
         except Exception as exc:
             logger.debug("fetch_models(%s): %s", self.name, exc)
             return None

@@ -2293,6 +2293,23 @@ def list_authenticated_providers(
                 _row["total_models"] = _row.get("total_models", len(_models)) + 1
             break
 
+    # Final picker safety net: rich metadata filters run at live catalog fetch
+    # time, but some rows come from static config, stale caches, or provider
+    # paths that only preserve IDs.  Keep non-text models available to other
+    # consumers, but do not offer them as agent backends in /model pickers.
+    try:
+        from hermes_cli.models import is_non_text_model_id
+
+        for row in results:
+            visible_models = [
+                m for m in (row.get("models") or [])
+                if not is_non_text_model_id(str(m))
+            ]
+            row["models"] = visible_models
+            row["total_models"] = len(visible_models)
+    except Exception:
+        pass
+
     # Sort: current provider first, then by model count descending
     results.sort(key=lambda r: (not r["is_current"], -r["total_models"]))
 
