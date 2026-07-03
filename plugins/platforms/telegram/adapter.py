@@ -3148,7 +3148,8 @@ class TelegramAdapter(BasePlatformAdapter):
             collect(task)
         for task in list(self._pending_photo_batch_tasks.values()):
             collect(task)
-        for task in list(self._pending_document_batch_tasks.values()):
+        document_tasks = getattr(self, "_pending_document_batch_tasks", {}) or {}
+        for task in list(document_tasks.values()):
             collect(task)
         for task in list(self._pending_text_batch_tasks.values()):
             collect(task)
@@ -3163,8 +3164,10 @@ class TelegramAdapter(BasePlatformAdapter):
         self._media_group_events.clear()
         self._pending_photo_batch_tasks.clear()
         self._pending_photo_batches.clear()
-        self._pending_document_batch_tasks.clear()
-        self._pending_document_batches.clear()
+        if hasattr(self, "_pending_document_batch_tasks"):
+            self._pending_document_batch_tasks.clear()
+        if hasattr(self, "_pending_document_batches"):
+            self._pending_document_batches.clear()
         self._pending_text_batch_tasks.clear()
         self._pending_text_batches.clear()
         if self._polling_error_task is not current_task:
