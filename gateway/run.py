@@ -20114,16 +20114,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 else:
                     _resume_guidance = (
-                        "Report to the user that the session was restored "
-                        "successfully and ask what they would like to do next."
+                        "This is an automatic resume turn with no new user message. "
+                        "Continue the interrupted task from the last useful completed "
+                        "tool results/context. Do not stop just to announce recovery "
+                        "or ask what to do next unless the task is genuinely blocked."
                     )
                 message = (
                     f"[System note: The previous turn was interrupted by "
                     f"{_reason_phrase}; the gateway is now back online. "
                     f"Any restart/shutdown command in the history has already "
                     f"run — do NOT re-execute or verify it. {_resume_guidance} "
-                    f"Do NOT re-execute old tool calls — skip any unfinished "
-                    f"work from the conversation history.]"
+                    f"Do NOT re-execute dangling/interrupted tool calls; use completed "
+                    f"tool results as context and proceed with the next logical step.]"
                     + (f"\n\n{message}" if message else "")
                 )
             elif _has_fresh_tool_tail:
@@ -20176,11 +20178,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"[System note: The previous turn was interrupted by "
                     f"{_sn_reason_phrase}; the gateway is now back online. "
                     f"Any restart/shutdown command in the history has already "
-                    f"run — do NOT re-execute or verify it. Report to the user "
-                    f"that the session was restored successfully and ask what "
-                    f"they would like to do next. Do NOT re-execute old tool "
-                    f"calls — skip any unfinished work from the conversation "
-                    f"history.]"
+                    f"run — do NOT re-execute or verify it. This is an automatic "
+                    f"resume turn with no new user message. Continue the interrupted "
+                    f"task from the last useful completed tool results/context. "
+                    f"Do not stop just to announce recovery or ask what to do next "
+                    f"unless the task is genuinely blocked. Do NOT re-execute "
+                    f"dangling/interrupted tool calls; use completed tool results as context "
+                    f"and proceed with the next logical step.]"
                 )
 
             _approval_session_key = session_key or ""
