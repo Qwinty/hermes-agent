@@ -25,6 +25,7 @@ from gateway.session import (
     SessionSource,
     SessionStore,
     sanitize_model_override,
+    sanitize_reasoning_override,
 )
 
 OVERRIDE = {
@@ -231,4 +232,52 @@ def test_sanitize_model_override():
         "model": "gpt-5o",
         "provider": "openai",
         "base_url": "https://api.openai.example/v1",
+    }
+
+def test_reasoning_override_persists_and_survives_restart(store_factory):
+    store = store_factory()
+    entry = store.get_or_create_session(_make_source())
+    session_key = entry.session_key
+
+    store.set_reasoning_override(session_key, {"enabled": True, "effort": "xhigh"})
+
+    store2 = store_factory()
+    assert store2.get_reasoning_override(session_key) == {"enabled": True, "effort": "xhigh"}
+
+
+def test_reasoning_override_clears(store_factory):
+    store = store_factory()
+    entry = store.get_or_create_session(_make_source())
+
+    store.set_reasoning_override(entry.session_key, {"enabled": False})
+    assert store.get_reasoning_override(entry.session_key) == {"enabled": False}
+
+    store.set_reasoning_override(entry.session_key, None)
+    assert store.get_reasoning_override(entry.session_key) is None
+
+
+def test_runner_rehydrates_reasoning_override_after_restart(store_factory):
+    store = store_factory()
+    entry = store.get_or_create_session(_make_source())
+    session_key = entry.session_key
+    store.set_reasoning_override(session_key, {"enabled": True, "effort": "high"})
+
+    runner = _make_runner(store_factory())
+    runner._session_reasoning_overrides = {}
+
+    assert runner._resolve_session_reasoning_config(session_key=session_key) == {
+        "enabled": True,
+        "effort": "high",
+    }
+
+
+def test_sanitize_reasoning_override():
+    assert sanitize_reasoning_override(None) is None
+    assert sanitize_reasoning_override({}) is None
+    assert sanitize_reasoning_override({"enabled": False, "api_key": "sk-x"}) == {
+        "enabled": False,
+    }
+    assert sanitize_reasoning_override({"enabled": True, "effort": "xhigh"}) == {
+        "enabled": True,
+        "effort": "xhigh",
     }
