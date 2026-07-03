@@ -156,6 +156,8 @@ class TestSupportedDocumentTypes:
             ".md",
             ".txt",
             ".zip",
+            ".rar",
+            ".7z",
             ".doc",
             ".docx",
             ".xls",
