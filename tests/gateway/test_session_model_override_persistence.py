@@ -272,12 +272,17 @@ def test_runner_rehydrates_reasoning_override_after_restart(store_factory):
 
 
 def test_sanitize_reasoning_override():
+    from hermes_constants import VALID_REASONING_EFFORTS
+
     assert sanitize_reasoning_override(None) is None
     assert sanitize_reasoning_override({}) is None
     assert sanitize_reasoning_override({"enabled": False, "api_key": "sk-x"}) == {
         "enabled": False,
     }
-    assert sanitize_reasoning_override({"enabled": True, "effort": "xhigh"}) == {
-        "enabled": True,
-        "effort": "xhigh",
-    }
+    for effort in VALID_REASONING_EFFORTS:
+        assert sanitize_reasoning_override({"enabled": True, "effort": effort}) == {
+            "enabled": True,
+            "effort": effort,
+        }
+    assert sanitize_reasoning_override({"enabled": "false", "effort": "xhigh"}) is None
+    assert sanitize_reasoning_override({"enabled": True, "effort": "weird"}) is None
