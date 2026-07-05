@@ -529,6 +529,79 @@ async def test_new_inside_telegram_topic_rewrites_binding_to_new_session(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_branch_inside_telegram_topic_rewrites_binding_and_renames_topic(tmp_path):
+    """Regression: /branch inside a Telegram DM topic must keep the topic on the branch.
+
+    Without rewriting telegram_dm_topic_bindings, the next inbound message in
+    the same topic resolves the stale parent binding and immediately switches
+    back to the original session, making /fork look like a no-op.
+    """
+    session_db = SessionDB(db_path=tmp_path / "state.db")
+    session_db.enable_telegram_topic_mode(chat_id="208214988", user_id="208214988")
+    session_db.create_session(
+        session_id="parent-topic-session",
+        source="telegram",
+        user_id="208214988",
+    )
+    topic_source = _make_source(thread_id="17585")
+    topic_key = build_session_key(topic_source)
+    session_db.bind_telegram_topic(
+        chat_id="208214988",
+        thread_id="17585",
+        user_id="208214988",
+        session_key=topic_key,
+        session_id="parent-topic-session",
+    )
+
+    runner = _make_runner(session_db=session_db)
+    runner.session_store.get_or_create_session.side_effect = None
+    parent_entry = SessionEntry(
+        session_key=topic_key,
+        session_id="parent-topic-session",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        origin=topic_source,
+    )
+    runner.session_store.get_or_create_session.return_value = parent_entry
+    runner.session_store.load_transcript.return_value = [
+        {"role": "user", "content": "research ozon"},
+        {"role": "assistant", "content": "working"},
+    ]
+
+    def _switch_session(session_key, target_session_id):
+        return SessionEntry(
+            session_key=session_key,
+            session_id=target_session_id,
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            origin=topic_source,
+        )
+
+    runner.session_store.switch_session = MagicMock(side_effect=_switch_session)
+
+    result = await runner._handle_branch_command(_make_event("/fork ozon", thread_id="17585"))
+
+    assert "Branched to" in result
+    assert "ozon" in result
+    branch_id = runner.session_store.switch_session.call_args.args[1]
+    binding = session_db.get_telegram_topic_binding(
+        chat_id="208214988", thread_id="17585",
+    )
+    assert binding is not None
+    assert binding["session_id"] == branch_id
+    assert binding["session_id"] != "parent-topic-session"
+    runner.adapters[Platform.TELEGRAM].rename_dm_topic.assert_awaited_once_with(
+        chat_id="208214988",
+        thread_id="17585",
+        name="ozon",
+    )
+
+
+@pytest.mark.asyncio
 async def test_topic_binding_follows_compression_tip_on_read(tmp_path, monkeypatch):
     """Stale topic bindings auto-heal to the compression child on next inbound.
 
