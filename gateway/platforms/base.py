@@ -1697,6 +1697,7 @@ class MessageType(Enum):
     LOCATION = "location"
     PHOTO = "photo"
     VIDEO = "video"
+    VIDEO_NOTE = "video_note"
     AUDIO = "audio"
     VOICE = "voice"
     DOCUMENT = "document"
@@ -1750,6 +1751,12 @@ class MessageEvent:
     reply_to_author_id: Optional[str] = None
     reply_to_author_name: Optional[str] = None
     reply_to_is_own_message: bool = False  # True when the user replied to this bot/assistant's message
+    reply_to_media_urls: List[str] = field(default_factory=list)
+    reply_to_media_types: List[str] = field(default_factory=list)
+
+    # Optional session override for transports whose per-turn delivery id is
+    # not the conversation id (e.g. Telegram Guest Bot guest_query_id).
+    session_key_override: Optional[str] = None
     
     # Auto-loaded skill(s) for topic/channel bindings (e.g., Telegram DM Topics,
     # Discord channel_skill_bindings).  A single name or ordered list.
@@ -3189,7 +3196,7 @@ class BasePlatformAdapter(ABC):
         images: List[Tuple[str, str]],
         metadata: Optional[Dict[str, Any]] = None,
         human_delay: float = 0.0,
-    ) -> None:
+    ) -> SendResult:
         """Send a batch of images.
 
         Accepts ``http(s)://``, ``file://`` URIs in the first tuple
@@ -3203,6 +3210,28 @@ class BasePlatformAdapter(ABC):
         (e.g. Signal's multi-attachment RPC)
         """
         from urllib.parse import unquote as _unquote
+
+        message_ids: list[str] = []
+        errors: list[str] = []
+
+        def _track_result(result: SendResult) -> None:
+            if result is None:
+                return
+            for mid in getattr(result, "continuation_message_ids", ()) or ():
+                text = str(mid).strip()
+                if text and text not in message_ids:
+                    message_ids.append(text)
+            raw = getattr(result, "raw_response", None)
+            if isinstance(raw, dict):
+                for mid in raw.get("message_ids") or ():
+                    text = str(mid).strip()
+                    if text and text not in message_ids:
+                        message_ids.append(text)
+            mid = getattr(result, "message_id", None)
+            if mid:
+                text = str(mid).strip()
+                if text and text not in message_ids:
+                    message_ids.append(text)
 
         for image_url, alt_text in images:
             if human_delay > 0:
@@ -3237,8 +3266,21 @@ class BasePlatformAdapter(ABC):
                     )
                 if not img_result.success:
                     logger.error("[%s] Failed to send image: %s", self.name, img_result.error)
+                    errors.append(str(img_result.error or "send failed"))
+                else:
+                    _track_result(img_result)
             except Exception as img_err:
                 logger.error("[%s] Error sending image: %s", self.name, img_err, exc_info=True)
+                errors.append(str(img_err))
+        if message_ids:
+            return SendResult(
+                success=True,
+                message_id=message_ids[-1],
+                raw_response={"message_ids": tuple(message_ids)},
+            )
+        if errors:
+            return SendResult(success=False, error="; ".join(errors))
+        return SendResult(success=True)
 
     async def send_image(
         self,
@@ -4605,11 +4647,13 @@ class BasePlatformAdapter(ABC):
         # Offloaded: the sync hook must not block the loop.
         await asyncio.to_thread(self._apply_topic_recovery, event)
 
-        session_key = build_session_key(
-            event.source,
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-        )
+        session_key = str(getattr(event, "session_key_override", "") or "").strip()
+        if not session_key:
+            session_key = build_session_key(
+                event.source,
+                group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+                thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            )
 
         # On-entry self-heal: if the adapter still has an _active_sessions
         # entry for this key but the owner task has already exited (done or
@@ -4822,6 +4866,12 @@ class BasePlatformAdapter(ABC):
             delivery_attempted = True
             if getattr(result, "success", False):
                 delivery_succeeded = True
+                recorder = getattr(event, "_hermes_delivery_recorder", None)
+                if callable(recorder):
+                    try:
+                        recorder(result)
+                    except Exception:
+                        logger.debug("Delivery recorder failed", exc_info=True)
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
@@ -4997,6 +5047,7 @@ class BasePlatformAdapter(ABC):
                         _tts_caption_delivered = bool(
                             telegram_tts_caption and getattr(tts_result, "success", False)
                         )
+                        _record_delivery(tts_result)
                     finally:
                         try:
                             os.remove(_tts_path)
@@ -5037,12 +5088,13 @@ class BasePlatformAdapter(ABC):
                 if images:
                     logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
                     try:
-                        await self.send_multiple_images(
+                        image_result = await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=images,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
+                        _record_delivery(image_result)
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
@@ -5079,12 +5131,13 @@ class BasePlatformAdapter(ABC):
                 if _image_paths:
                     try:
                         _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
-                        await self.send_multiple_images(
+                        image_result = await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=_batch,
                             metadata=_final_thread_metadata,
                             human_delay=human_delay,
                         )
+                        _record_delivery(image_result)
                     except Exception as batch_err:
                         logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
 
@@ -5114,6 +5167,7 @@ class BasePlatformAdapter(ABC):
 
                         if not media_result.success:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
+                        _record_delivery(media_result)
                     except Exception as media_err:
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
 
@@ -5124,17 +5178,18 @@ class BasePlatformAdapter(ABC):
                     try:
                         ext = Path(file_path).suffix.lower()
                         if ext in _VIDEO_EXTS:
-                            await self.send_video(
+                            file_result = await self.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=file_path,
                                 metadata=_final_thread_metadata,
                             )
                         else:
-                            await self.send_document(
+                            file_result = await self.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=file_path,
                                 metadata=_final_thread_metadata,
                             )
+                        _record_delivery(file_result)
                     except Exception as file_err:
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
 

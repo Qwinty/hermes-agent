@@ -19,6 +19,7 @@ import asyncio
 import dataclasses
 import hashlib
 import inspect
+import json
 import logging
 import os
 import re
@@ -32,7 +33,7 @@ from typing import Any, Optional, Union
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
 from gateway.config import HomeChannel, Platform, PlatformConfig
-from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
+from gateway.platforms.base import BasePlatformAdapter, EphemeralReply, MessageEvent, MessageType
 from gateway.session import (
     SessionSource,
     build_session_key,
@@ -184,8 +185,7 @@ class GatewaySlashCommandsMixin:
 
         # Clear any session-scoped model/reasoning overrides so the next agent
         # picks up configured defaults instead of previous session switches.
-        self._session_model_overrides.pop(session_key, None)
-        self._set_session_reasoning_override(session_key, None)
+        self._clear_session_runtime_overrides(session_key)
         if hasattr(self, "_pending_model_notes"):
             self._pending_model_notes.pop(session_key, None)
 
@@ -698,11 +698,39 @@ class GatewaySlashCommandsMixin:
         """
         if origin is None or current is None:
             return False
+        chat_type = (getattr(current, "chat_type", "") or "").lower()
         if origin.platform != current.platform:
             return False
         if origin.chat_id != current.chat_id:
             return False
-        # thread_id is part of the session key for every chat type when present
+        # DM-like chats are always per-user.
+        if chat_type in {"dm", "direct", "private", ""}:
+            # chat_id was already required equal above and, when present, IS the
+            # DM session key — so an equal non-empty chat_id is sufficient.
+            #
+            # Telegram Direct Messages topics are modeled as DM ``thread_id``
+            # lanes under the same private chat. Users intentionally use
+            # ``/resume`` to move their own transcript between those lanes; that
+            # is same-user/same-DM access, not the cross-room/group IDOR this
+            # guard prevents. Therefore DM-like chats do NOT require thread
+            # equality when chat_id is present. Non-DM threads remain scoped
+            # below before any sharing logic.
+            # build_session_key only falls back to the participant id
+            # (``user_id_alt or user_id`` — Signal/Feishu key on user_id_alt)
+            # when there is NO chat_id; mirror that and fail closed on a
+            # missing/different participant so two no-chat_id DM origins are
+            # never conflated (was: compared user_id only and allowed when
+            # either side was missing).
+            if str(getattr(current, "chat_id", "") or ""):
+                return True
+            if str(getattr(current, "thread_id", "") or "") != str(
+                getattr(origin, "thread_id", "") or ""
+            ):
+                return False
+            cur_pid = str(current.user_id_alt or current.user_id or "")
+            org_pid = str(origin.user_id_alt or origin.user_id or "")
+            return bool(cur_pid) and cur_pid == org_pid
+        # thread_id is part of the session key for non-DM chats when present
         # (build_session_key appends it unconditionally), so a session in one
         # thread is a DIFFERENT session from another thread of the same parent
         # chat. is_shared_multi_user_session only decides participant sharing
@@ -713,22 +741,6 @@ class GatewaySlashCommandsMixin:
             getattr(origin, "thread_id", "") or ""
         ):
             return False
-        chat_type = (getattr(current, "chat_type", "") or "").lower()
-        # DM-like chats are always per-user.
-        if chat_type in {"dm", "direct", "private", ""}:
-            # chat_id was already required equal above and, when present, IS the
-            # DM session key — so an equal non-empty chat_id is sufficient.
-            # build_session_key only falls back to the participant id
-            # (``user_id_alt or user_id`` — Signal/Feishu key on user_id_alt)
-            # when there is NO chat_id; mirror that and fail closed on a
-            # missing/different participant so two no-chat_id DM origins are
-            # never conflated (was: compared user_id only and allowed when
-            # either side was missing).
-            if str(getattr(current, "chat_id", "") or ""):
-                return True
-            cur_pid = str(current.user_id_alt or current.user_id or "")
-            org_pid = str(origin.user_id_alt or origin.user_id or "")
-            return bool(cur_pid) and cur_pid == org_pid
         # Non-DM: scope by participant whenever the session key for this source
         # is per-user. is_shared_multi_user_session mirrors build_session_key's
         # isolation rules exactly, so the guard stays in lock-step with the key.
@@ -845,14 +857,12 @@ class GatewaySlashCommandsMixin:
             # NULL-chat rows are intentionally not resumable this way; use a
             # live session or an explicit admin override.)
             # Common origin proof for any identity-bearing caller: a non-blank
-            # source that matches the caller's platform, and the same thread. A
-            # blank/legacy source can't prove the platform; a different thread is
-            # a different session (build_session_key appends thread_id).
-            origin_ok = (
-                bool(row_src) and bool(caller_src)
-                and str(row_src) == str(caller_src)
-                and row_thread == caller_thread
-            )
+            # source that matches the caller's platform. A blank/legacy source
+            # can't prove the platform. For non-DM chats, a different thread is
+            # a different origin and is checked below. DM-like chats (notably
+            # Telegram Direct Messages topics) may intentionally resume the same
+            # user's transcript across thread lanes in the same private chat.
+            origin_ok = bool(row_src) and bool(caller_src) and str(row_src) == str(caller_src)
             if not origin_ok:
                 return False
             if caller_is_dm:
@@ -869,10 +879,18 @@ class GatewaySlashCommandsMixin:
                 # apply there.
                 if caller_keys_on_alt and not (bool(row_chat) and bool(caller_chat)):
                     return False
+                # With a real DM chat_id (Telegram private chat), thread lanes
+                # are user-visible topics that may resume each other. Without a
+                # chat_id, build_session_key falls back to participant+thread, so
+                # the thread remains part of the provenance proof.
+                if not (bool(row_chat) and bool(caller_chat)) and row_thread != caller_thread:
+                    return False
                 return (
                     bool(row_uid) and row_uid == caller_uid
                     and row_chat == caller_chat
                 )
+            if row_thread != caller_thread:
+                return False
             # Non-DM (group/channel/forum/thread): build_session_key includes
             # chat_id, so a row (or caller) with NO chat provenance cannot prove
             # same-chat. Require both sides non-blank and equal — a legacy
@@ -1595,13 +1613,16 @@ class GatewaySlashCommandsMixin:
                             f"via {result.provider_label or result.target_provider}. "
                             f"Adjust your self-identification accordingly.]"
                         )
-                        _self._session_model_overrides[_session_key] = {
-                            "model": result.new_model,
-                            "provider": result.target_provider,
-                            "api_key": result.api_key,
-                            "base_url": result.base_url,
-                            "api_mode": result.api_mode,
-                        }
+                        _self._set_session_model_override(
+                            _session_key,
+                            {
+                                "model": result.new_model,
+                                "provider": result.target_provider,
+                                "api_key": result.api_key,
+                                "base_url": result.base_url,
+                                "api_mode": result.api_mode,
+                            },
+                        )
 
                         # Write-through the non-secret parts to the session
                         # store so the picked model survives a gateway restart
@@ -1952,6 +1973,18 @@ class GatewaySlashCommandsMixin:
                 lines.append(t("gateway.model.saved_global"))
             else:
                 lines.append(t("gateway.model.session_only_hint"))
+
+            # Store session override so next agent creation uses the new model
+            self._set_session_model_override(
+                session_key,
+                {
+                    "model": result.new_model,
+                    "provider": result.target_provider,
+                    "api_key": result.api_key,
+                    "base_url": result.base_url,
+                    "api_mode": result.api_mode,
+                },
+            )
 
             return "\n".join(lines)
 
@@ -2344,6 +2377,101 @@ class GatewaySlashCommandsMixin:
         idx = len(mgr.state.subgoals) if mgr.state else 0
         return f"✓ Added subgoal {idx}: {text}"
 
+    @staticmethod
+    def _undo_platform_message_ids(value: Any) -> list[str]:
+        ids: list[str] = []
+
+        def _add(item: Any) -> None:
+            if item is None:
+                return
+            if isinstance(item, (list, tuple, set)):
+                for nested in item:
+                    _add(nested)
+                return
+            text = str(item).strip()
+            if text and text != "__no_edit__" and text not in ids:
+                ids.append(text)
+
+        if value is None:
+            return ids
+        if isinstance(value, (list, tuple, set)):
+            _add(value)
+            return ids
+
+        text = str(value).strip()
+        if not text:
+            return ids
+
+        try:
+            parsed = json.loads(text)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            parsed = None
+        if parsed is not None:
+            _add(parsed)
+            return ids
+
+        if "," in text:
+            for part in text.split(","):
+                _add(part)
+            return ids
+
+        _add(text)
+        return ids
+
+    def _rewound_platform_message_ids(self, rewind_result: dict[str, Any]) -> list[str]:
+        ids: list[str] = []
+        for row in rewind_result.get("rewound_messages") or ():
+            if not isinstance(row, dict):
+                continue
+            if row.get("role") not in {"user", "assistant"}:
+                continue
+            raw_id = row.get("platform_message_id") or row.get("message_id")
+            for message_id in self._undo_platform_message_ids(raw_id):
+                if message_id not in ids:
+                    ids.append(message_id)
+        return ids
+
+    @staticmethod
+    def _adapter_overrides_delete_message(adapter: Any) -> bool:
+        if adapter is None:
+            return False
+        delete_fn = getattr(adapter, "delete_message", None)
+        if not callable(delete_fn):
+            return False
+        try:
+            class_delete = inspect.getattr_static(type(adapter), "delete_message")
+        except Exception:
+            return True
+        return class_delete is not BasePlatformAdapter.delete_message
+
+    async def _delete_telegram_rewound_messages(
+        self,
+        event: MessageEvent,
+        rewind_result: dict[str, Any],
+    ) -> dict[str, int]:
+        source = event.source
+        if not source or source.platform != Platform.TELEGRAM or not source.chat_id:
+            return {"attempted": 0, "deleted": 0}
+
+        adapter = self.adapters.get(source.platform) if getattr(self, "adapters", None) else None
+        if not self._adapter_overrides_delete_message(adapter):
+            return {"attempted": 0, "deleted": 0}
+
+        message_ids = self._rewound_platform_message_ids(rewind_result)
+        deleted = 0
+        for message_id in message_ids:
+            try:
+                if await adapter.delete_message(str(source.chat_id), str(message_id)):
+                    deleted += 1
+            except Exception as exc:
+                logger.debug(
+                    "undo: Telegram delete_message failed chat=%s message=%s: %s",
+                    source.chat_id,
+                    message_id,
+                    exc,
+                )
+        return {"attempted": len(message_ids), "deleted": deleted}
+
     async def _handle_undo_command(self, event: MessageEvent) -> str:
         """Handle /undo [N] — back up N user turns (default 1), soft-deleting
         the truncated rows on disk and echoing the backed-up message text so
@@ -2384,14 +2512,25 @@ class GatewaySlashCommandsMixin:
         except Exception as e:
             logger.debug("undo: cached-agent eviction skipped: %s", e)
 
+        delete_stats = await self._delete_telegram_rewound_messages(event, result)
+
         target_text = result["target_text"]
         preview = target_text[:200] + "..." if len(target_text) > 200 else target_text
-        return t(
+        response = t(
             "gateway.undo.removed",
             turns=result["turns_undone"],
             count=result["rewound_count"],
             preview=preview,
         )
+        attempted = delete_stats.get("attempted", 0)
+        deleted = delete_stats.get("deleted", 0)
+        if attempted and deleted < attempted:
+            response += "\n\n" + t(
+                "gateway.undo.telegram_cleanup_partial",
+                deleted=deleted,
+                attempted=attempted,
+            )
+        return response
 
     async def _handle_set_home_command(self, event: MessageEvent) -> str:
         """Handle /sethome command -- set the current chat as the platform's home channel."""
@@ -3822,6 +3961,26 @@ class GatewaySlashCommandsMixin:
         new_entry = self.session_store.switch_session(session_key, new_session_id)
         if not new_entry:
             return t("gateway.branch.switch_failed")
+
+        sync_topic_binding = getattr(self, "_sync_telegram_topic_binding", None)
+        if callable(sync_topic_binding):
+            try:
+                await asyncio.to_thread(
+                    sync_topic_binding,
+                    source,
+                    new_entry,
+                    reason="branch-command",
+                )
+            except Exception:
+                logger.debug("Failed to sync Telegram topic binding after branch", exc_info=True)
+
+        rename_topic = getattr(self, "_rename_telegram_topic_for_session_title", None)
+        if callable(rename_topic):
+            try:
+                await rename_topic(source, new_session_id, branch_title)
+            except Exception:
+                logger.debug("Failed to rename Telegram topic after branch", exc_info=True)
+
         self._clear_session_boundary_security_state(session_key)
 
         # Evict any cached agent for this session
@@ -4053,6 +4212,52 @@ class GatewaySlashCommandsMixin:
                 parts.extend(credits_lines)
             return "\n".join(parts)
         return t("gateway.usage.no_data")
+
+    async def _handle_context_command(self, event: MessageEvent) -> str:
+        """Handle /context -- show what occupies the current prompt window."""
+        from gateway.run import _AGENT_PENDING_SENTINEL
+
+        source = event.source
+        session_key = self._session_key_for_source(source)
+
+        agent = self._running_agents.get(session_key)
+        if not agent or agent is _AGENT_PENDING_SENTINEL:
+            _cache_lock = getattr(self, "_agent_cache_lock", None)
+            _cache = getattr(self, "_agent_cache", None)
+            if _cache_lock and _cache is not None:
+                with _cache_lock:
+                    cached = _cache.get(session_key)
+                    if cached:
+                        agent = cached[0]
+
+        session_entry = self.session_store.get_or_create_session(source)
+        history = self.session_store.load_transcript(session_entry.session_id)
+        messages = list(getattr(agent, "_session_messages", None) or history or [])
+        if not agent:
+            if history:
+                from agent.model_metadata import estimate_messages_tokens_rough
+
+                msgs = [
+                    m for m in history
+                    if m.get("role") in {"user", "assistant", "tool", "system"}
+                ]
+                approx = estimate_messages_tokens_rough(msgs)
+                return (
+                    "🧠 Context Window\n"
+                    f"Estimated messages: {approx:,} tok\n"
+                    f"Messages: {len(msgs)}\n"
+                    "Detailed system/tool breakdown is available after the first agent turn."
+                )
+            return "No context data yet -- send a message first."
+
+        try:
+            from agent.context_report import build_context_report, format_context_report
+
+            report = build_context_report(agent, messages)
+            return format_context_report(report, compact=True)
+        except Exception as exc:
+            logger.warning("Context command failed: %s", exc)
+            return f"Context report failed: {exc}"
 
     async def _handle_insights_command(self, event: MessageEvent) -> str:
         """Handle /insights command -- show usage insights and analytics."""

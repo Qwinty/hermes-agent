@@ -154,6 +154,22 @@ async def test_text_model_switch_writes_session_override_through_to_db(monkeypat
     assert runner._session_model_overrides[session_key] == _model_override()
 
 
+def test_runtime_override_writes_use_async_db_wrapper_sync_core():
+    """Synchronous gateway helpers must write through AsyncSessionDB._db."""
+    db = _FakeRuntimeOverrideDB()
+    runner = _make_runner(SimpleNamespace(_db=db))
+    session_key = build_session_key(_make_source())
+
+    runner._set_session_model_override(session_key, _model_override())
+    runner._set_session_reasoning_override(session_key, {"enabled": True, "effort": "xhigh"})
+    runner._set_session_reasoning_override(session_key, None)
+
+    assert db.set_model_calls == [(session_key, _model_override())]
+    assert db.set_reasoning_calls == [(session_key, {"enabled": True, "effort": "xhigh"})]
+    assert db.del_reasoning_calls == [session_key]
+    assert session_key not in runner._session_reasoning_overrides
+
+
 def test_reasoning_override_set_and_clear_write_through_to_db():
     """Session reasoning overrides are persisted and removed with the in-memory value."""
     db = _FakeRuntimeOverrideDB()
@@ -166,6 +182,19 @@ def test_reasoning_override_set_and_clear_write_through_to_db():
     assert db.set_reasoning_calls == [(session_key, {"enabled": True, "effort": "xhigh"})]
     assert db.del_reasoning_calls == [session_key]
     assert session_key not in runner._session_reasoning_overrides
+
+
+def test_clearing_session_runtime_overrides_uses_async_db_wrapper_sync_core():
+    db = _FakeRuntimeOverrideDB()
+    runner = _make_runner(SimpleNamespace(_db=db))
+    session_key = build_session_key(_make_source())
+    runner._session_model_overrides[session_key] = _model_override()
+    runner._session_reasoning_overrides[session_key] = {"enabled": True, "effort": "low"}
+
+    runner._clear_session_runtime_overrides(session_key)
+
+    assert db.del_model_calls == [session_key]
+    assert db.del_reasoning_calls == [session_key]
 
 
 def test_clearing_session_runtime_overrides_removes_both_db_entries():

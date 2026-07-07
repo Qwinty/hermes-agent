@@ -266,8 +266,78 @@ async def test_managed_topic_binding_reuses_restored_session_over_static_lane_se
 
     result = await runner._handle_message(_make_event("continue restored", thread_id="17585"))
 
-    assert result == "restored response"
+    assert result.split("\n\n", 1)[0] == "restored response"
     assert captured["session_id"] == "restored-session"
+
+
+@pytest.mark.asyncio
+async def test_topic_binding_switch_preserves_resume_pending_metadata(
+    tmp_path, monkeypatch
+):
+    import gateway.run as gateway_run
+
+    session_db = SessionDB(db_path=tmp_path / "state.db")
+    session_db.enable_telegram_topic_mode(chat_id="208214988", user_id="208214988")
+    session_db.create_session(
+        session_id="restored-session",
+        source="telegram",
+        user_id="208214988",
+    )
+    topic_source = _make_source(thread_id="17585")
+    topic_key = build_session_key(topic_source)
+    session_db.bind_telegram_topic(
+        chat_id="208214988",
+        thread_id="17585",
+        user_id="208214988",
+        session_key=topic_key,
+        session_id="restored-session",
+    )
+
+    runner = _make_runner(session_db=session_db)
+    marker = datetime.now()
+    pending_entry = SessionEntry(
+        session_key=topic_key,
+        session_id="fresh-empty-session",
+        created_at=marker,
+        updated_at=marker,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        origin=topic_source,
+        resume_pending=True,
+        resume_reason="restart_timeout",
+        last_resume_marked_at=marker,
+    )
+    switched_entry = SessionEntry(
+        session_key=topic_key,
+        session_id="restored-session",
+        created_at=marker,
+        updated_at=marker,
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        origin=topic_source,
+    )
+    runner.session_store.get_or_create_session.side_effect = None
+    runner.session_store.get_or_create_session.return_value = pending_entry
+    runner.session_store.switch_session.side_effect = None
+    runner.session_store.switch_session.return_value = switched_entry
+    runner._run_agent = AsyncMock(
+        return_value={
+            "success": True,
+            "final_response": "restored response",
+            "session_id": "restored-session",
+            "messages": [],
+        }
+    )
+
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    await runner._handle_message(_make_event("continue restored", thread_id="17585"))
+
+    assert switched_entry.resume_pending is True
+    assert switched_entry.resume_reason == "restart_timeout"
+    assert switched_entry.last_resume_marked_at == marker
 
 
 @pytest.mark.asyncio
@@ -456,6 +526,79 @@ async def test_new_inside_telegram_topic_rewrites_binding_to_new_session(tmp_pat
     )
     assert binding is not None
     assert binding["session_id"] == "new-topic-session"
+
+
+@pytest.mark.asyncio
+async def test_branch_inside_telegram_topic_rewrites_binding_and_renames_topic(tmp_path):
+    """Regression: /branch inside a Telegram DM topic must keep the topic on the branch.
+
+    Without rewriting telegram_dm_topic_bindings, the next inbound message in
+    the same topic resolves the stale parent binding and immediately switches
+    back to the original session, making /fork look like a no-op.
+    """
+    session_db = SessionDB(db_path=tmp_path / "state.db")
+    session_db.enable_telegram_topic_mode(chat_id="208214988", user_id="208214988")
+    session_db.create_session(
+        session_id="parent-topic-session",
+        source="telegram",
+        user_id="208214988",
+    )
+    topic_source = _make_source(thread_id="17585")
+    topic_key = build_session_key(topic_source)
+    session_db.bind_telegram_topic(
+        chat_id="208214988",
+        thread_id="17585",
+        user_id="208214988",
+        session_key=topic_key,
+        session_id="parent-topic-session",
+    )
+
+    runner = _make_runner(session_db=session_db)
+    runner.session_store.get_or_create_session.side_effect = None
+    parent_entry = SessionEntry(
+        session_key=topic_key,
+        session_id="parent-topic-session",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        origin=topic_source,
+    )
+    runner.session_store.get_or_create_session.return_value = parent_entry
+    runner.session_store.load_transcript.return_value = [
+        {"role": "user", "content": "research ozon"},
+        {"role": "assistant", "content": "working"},
+    ]
+
+    def _switch_session(session_key, target_session_id):
+        return SessionEntry(
+            session_key=session_key,
+            session_id=target_session_id,
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            platform=Platform.TELEGRAM,
+            chat_type="dm",
+            origin=topic_source,
+        )
+
+    runner.session_store.switch_session = MagicMock(side_effect=_switch_session)
+
+    result = await runner._handle_branch_command(_make_event("/fork ozon", thread_id="17585"))
+
+    assert "Branched to" in result
+    assert "ozon" in result
+    branch_id = runner.session_store.switch_session.call_args.args[1]
+    binding = session_db.get_telegram_topic_binding(
+        chat_id="208214988", thread_id="17585",
+    )
+    assert binding is not None
+    assert binding["session_id"] == branch_id
+    assert binding["session_id"] != "parent-topic-session"
+    runner.adapters[Platform.TELEGRAM].rename_dm_topic.assert_awaited_once_with(
+        chat_id="208214988",
+        thread_id="17585",
+        name="ozon",
+    )
 
 
 @pytest.mark.asyncio

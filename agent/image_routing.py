@@ -438,15 +438,16 @@ def decide_image_input_mode(
     if mode_cfg == "text":
         return "text"
 
-    # auto: prefer native vision when the main model supports it. An
-    # explicit auxiliary.vision config acts as a *fallback* for text-only
-    # main models — it should not preempt native vision on a model that
-    # can natively inspect the pixels (issue #29135).
+    # auto: prefer native vision when the active main model supports it.
+    # auxiliary.vision is a fallback for text-only models, not a blocker for
+    # models that can see pixels directly.
     supports = _lookup_supports_vision(provider, model, cfg)
     if supports is True:
         return "native"
+
     if _explicit_aux_vision_override(cfg):
         return "text"
+
     return "text"
 
 

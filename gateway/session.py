@@ -1622,7 +1622,8 @@ class SessionStore:
     def get_or_create_session(
         self,
         source: SessionSource,
-        force_new: bool = False
+        force_new: bool = False,
+        session_key_override: Optional[str] = None,
     ) -> SessionEntry:
         """
         Get an existing session or create a new one.
@@ -1630,7 +1631,7 @@ class SessionStore:
         Evaluates reset policy to determine if the existing session is stale.
         Creates a session record in SQLite when a new session starts.
         """
-        session_key = self._generate_session_key(source)
+        session_key = str(session_key_override or "").strip() or self._generate_session_key(source)
         now = _now()
 
         # SQLite calls are made outside the lock to avoid holding it during I/O.
@@ -1661,6 +1662,11 @@ class SessionStore:
                 self._heal_compression_tip_locked(
                     entry, existing_session_id, canonical_existing_session_id
                 )
+                if source.message_id:
+                    if entry.origin is None:
+                        entry.origin = source
+                    else:
+                        entry.origin.message_id = source.message_id
 
                 # Self-heal stale routing: if this session_key still points at
                 # a session that has ALREADY been ended in state.db (end_reason
@@ -2284,8 +2290,9 @@ class SessionStore:
         survive for audit and stay hidden from re-prompts and search. Mirrors
         the CLI/TUI ``/undo [N]`` behavior via ``SessionDB.rewind_to_message``.
 
-        Returns a dict ``{"rewound_count", "turns_undone", "target_text"}`` on
-        success, or ``None`` if there's no DB or no user message to back up to.
+        Returns a dict ``{"rewound_count", "turns_undone", "target_text",
+        "rewound_messages"}`` on success, or ``None`` if there's no DB or no
+        user message to back up to.
         ``n`` clamps to the oldest user turn when it exceeds the turn count.
         """
         if not self._db:
@@ -2326,6 +2333,7 @@ class SessionStore:
             "rewound_count": result.get("rewound_count", 0),
             "turns_undone": target_idx + 1,
             "target_text": target_text,
+            "rewound_messages": result.get("rewound_messages", []),
         }
 
 

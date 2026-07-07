@@ -90,6 +90,7 @@ def _make_message(document=None, caption=None, media_group_id=None, photo=None):
     msg.date = None
     # Media flags — all None except explicit payload
     msg.photo = photo
+    msg.video_note = None
     msg.video = None
     msg.audio = None
     msg.voice = None
@@ -123,6 +124,12 @@ def _make_video(file_obj=None):
     return video
 
 
+def _make_video_note(file_obj=None):
+    video_note = MagicMock()
+    video_note.get_file = AsyncMock(return_value=file_obj or _make_file_obj(b"video-note-bytes"))
+    return video_note
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -150,6 +157,39 @@ def _redirect_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "gateway.platforms.base.VIDEO_CACHE_DIR", tmp_path / "video_cache"
     )
+
+
+# ---------------------------------------------------------------------------
+# TestMediaHandlerFilter
+# ---------------------------------------------------------------------------
+
+class _FilterToken:
+    def __init__(self, *names):
+        self.names = set(names)
+
+    def __or__(self, other):
+        return _FilterToken(*(self.names | other.names))
+
+
+class TestMediaHandlerFilter:
+    def test_media_filter_includes_video_note(self, monkeypatch):
+        """Telegram video-note updates need an explicit PTB filter to reach the media handler."""
+        import gateway.platforms.telegram as telegram_mod
+
+        fake_filters = SimpleNamespace(
+            PHOTO=_FilterToken("PHOTO"),
+            VIDEO=_FilterToken("VIDEO"),
+            VIDEO_NOTE=_FilterToken("VIDEO_NOTE"),
+            AUDIO=_FilterToken("AUDIO"),
+            VOICE=_FilterToken("VOICE"),
+            Document=SimpleNamespace(ALL=_FilterToken("DOCUMENT")),
+            Sticker=SimpleNamespace(ALL=_FilterToken("STICKER")),
+        )
+        monkeypatch.setattr(telegram_mod, "filters", fake_filters)
+
+        combined = TelegramAdapter._media_message_filter()
+
+        assert "VIDEO_NOTE" in combined.names
 
 
 # ---------------------------------------------------------------------------
@@ -476,6 +516,21 @@ class TestDocumentDownloadBlock:
 
 
 class TestVideoDownloadBlock:
+    @pytest.mark.asyncio
+    async def test_native_video_note_is_cached_and_marked_for_stt(self, adapter):
+        file_obj = _make_file_obj(b"fake-video-note")
+        file_obj.file_path = "video_notes/round-message.mp4"
+        msg = _make_message()
+        msg.video_note = _make_video_note(file_obj)
+        update = _make_update(msg)
+
+        await adapter._handle_media_message(update, MagicMock())
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type == MessageType.VIDEO_NOTE
+        assert len(event.media_urls) == 1
+        assert os.path.exists(event.media_urls[0])
+        assert event.media_types == [SUPPORTED_VIDEO_TYPES[".mp4"]]
+
     @pytest.mark.asyncio
     async def test_native_video_is_cached(self, adapter):
         file_obj = _make_file_obj(b"fake-mp4")

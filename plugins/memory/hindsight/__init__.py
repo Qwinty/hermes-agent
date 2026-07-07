@@ -17,7 +17,6 @@ Config via environment variables:
   HINDSIGHT_MODE                   — cloud or local (default: cloud)
   HINDSIGHT_TIMEOUT                — API request timeout in seconds (default: 120)
   HINDSIGHT_IDLE_TIMEOUT           — embedded daemon idle timeout seconds; 0 disables shutdown (default: 300)
-  HINDSIGHT_EMBED_PORT_HEALTH_GRACE_TIMEOUT — seconds to wait for a slow embedded daemon /health before treating it as stale (default: 30; set via config.json port_health_grace_timeout)
   HINDSIGHT_RETAIN_TAGS            — comma-separated tags attached to retained memories
   HINDSIGHT_RETAIN_OBSERVATION_SCOPES — observation scoping for retained memories: per_tag/combined/all_combinations, or a JSON list of tag-lists for custom scopes
   HINDSIGHT_RETAIN_SOURCE          — metadata source value attached to retained memories
@@ -38,6 +37,7 @@ import logging
 import os
 import queue
 import re
+
 import threading
 
 from datetime import datetime, timezone
@@ -115,6 +115,14 @@ def _parse_bool_setting(value: Any, default: bool) -> bool:
         return False
     logger.warning("Invalid boolean Hindsight setting %r; using default %s", value, default)
     return default
+# Env var the embedded daemon manager reads (at import time, as a module-level
+# constant) to size the grace window it waits for a slow /health before
+# declaring a daemon stale and killing it. Default upstream is 30s; on
+# resource-contended hosts a busy daemon can exceed a single 2s health check
+# and get needlessly killed + restarted (issue #13125 comment thread). We
+# surface it as plugin config so users can raise it without hand-setting an
+# env var, consistent with "config.json, not raw env vars".
+_PORT_HEALTH_GRACE_ENV = "HINDSIGHT_EMBED_PORT_HEALTH_GRACE_TIMEOUT"
 
 
 def _normalize_pattern_list(value: Any) -> list[str]:
@@ -674,16 +682,6 @@ def _resolve_bank_id_template(template: str, fallback: str, **placeholders: str)
 class HindsightMemoryProvider(MemoryProvider):
     """Hindsight long-term memory with knowledge graph and multi-strategy retrieval."""
 
-    def backup_paths(self) -> List[str]:
-        """Hindsight's legacy shared config and embedded-mode profile env
-        files live under ~/.hindsight (see _load_config / line ~509)."""
-        try:
-            from pathlib import Path
-            legacy_dir = Path.home() / ".hindsight"
-            return [str(legacy_dir)]
-        except Exception:
-            return []
-
     def __init__(self):
         self._config = None
         self._api_key = None
@@ -741,6 +739,10 @@ class HindsightMemoryProvider(MemoryProvider):
         self._retain_context = "conversation between Hermes Agent and the User"
         self._turn_counter = 0
         self._session_turns: list[str] = []  # pending turns since last retain
+        # Pending-turn delta mode clears this buffer after enqueueing a retain
+        # job; keep the watermark for compatibility with session-switch reset
+        # paths that clear all retain bookkeeping together.
+        self._last_retained_turn_count = 0
         self._auto_retain_filter_enabled = True
         self._auto_retain_strip_patterns: list[str] = list(_DEFAULT_AUTO_RETAIN_STRIP_PATTERNS)
         self._auto_retain_skip_patterns: list[str] = list(_DEFAULT_AUTO_RETAIN_SKIP_PATTERNS)
@@ -1062,7 +1064,6 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
             {"key": "timeout", "description": "API request timeout in seconds", "default": _DEFAULT_TIMEOUT},
             {"key": "idle_timeout", "description": "Embedded daemon idle timeout in seconds (0 disables auto-shutdown)", "default": _DEFAULT_IDLE_TIMEOUT, "when": {"mode": "local_embedded"}},
-            {"key": "port_health_grace_timeout", "description": "Seconds to wait for a slow daemon /health before treating it as stale (raise on busy/low-resource hosts; blank uses the 30s default)", "default": "", "when": {"mode": "local_embedded"}},
         ]
 
     def _get_client(self):
@@ -1543,30 +1544,6 @@ class HindsightMemoryProvider(MemoryProvider):
         # doesn't block the chat. Redirect stdout/stderr to a log file to
         # prevent rich startup output from spamming the terminal.
         if self._mode == "local_embedded":
-            # PostgreSQL's initdb refuses to run as root by design, so the
-            # embedded daemon can never initialize its data directory under
-            # root. Without this guard the daemon-start thread would fail,
-            # retry, and loop forever — each cycle reloading embedding models
-            # (~958MB RAM, ~33% CPU) with no user-visible error. Detect root
-            # up front and skip daemon startup with a clear message instead.
-            if hasattr(os, "geteuid") and os.geteuid() == 0:
-                msg = (
-                    "Hindsight local_embedded mode cannot run as root "
-                    "(PostgreSQL initdb refuses root). Skipping the embedded "
-                    "memory daemon. Run Hermes as a non-root user, or switch "
-                    "to cloud / local_external mode via 'hermes memory setup'."
-                )
-                logger.warning(msg)
-                # Surface to the terminal too — a daemon that never starts
-                # would otherwise fail silently and the user would only see
-                # Hermes get sluggish. (issue #13125)
-                try:
-                    print(f"  ⚠ {msg}", file=sys.stderr, flush=True)
-                except Exception:
-                    pass
-                self._mode = "disabled"
-                return
-
             def _start_daemon():
                 import traceback
                 log_dir = get_hermes_home() / "logs"

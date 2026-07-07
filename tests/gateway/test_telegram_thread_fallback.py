@@ -146,7 +146,7 @@ def test_non_forum_group_reply_thread_id_does_not_fork_session_key():
         caption=None,
         chat=SimpleNamespace(
             id=-100123,
-            type=telegram_mod.ChatType.SUPERGROUP,
+            type="supergroup",
             is_forum=False,
             title="Regular group",
         ),
@@ -180,7 +180,7 @@ def test_forum_group_topic_message_preserves_thread_session_key():
         caption=None,
         chat=SimpleNamespace(
             id=-100123,
-            type=telegram_mod.ChatType.SUPERGROUP,
+            type="supergroup",
             is_forum=True,
             title="Forum group",
         ),
@@ -210,7 +210,7 @@ def test_forum_general_topic_without_message_thread_id_keeps_thread_context():
         caption=None,
         chat=SimpleNamespace(
             id=-100123,
-            type=telegram_mod.ChatType.SUPERGROUP,
+            type="supergroup",
             is_forum=True,
             title="Forum group",
         ),
@@ -989,6 +989,8 @@ async def test_media_group_dm_topic_reply_not_found_retry_drops_thread_id(tmp_pa
     adapter = _make_adapter()
     image_path = tmp_path / "photo.png"
     image_path.write_bytes(b"png-data")
+    image_path_2 = tmp_path / "photo2.png"
+    image_path_2.write_bytes(b"png-data-2")
     call_log = []
 
     async def mock_send_media_group(**kwargs):
@@ -1001,7 +1003,10 @@ async def test_media_group_dm_topic_reply_not_found_retry_drops_thread_id(tmp_pa
 
     await adapter.send_multiple_images(
         chat_id="123",
-        images=[(f"file://{image_path}", "caption")],
+        images=[
+            (f"file://{image_path}", "caption"),
+            (f"file://{image_path_2}", ""),
+        ],
         metadata={
             "thread_id": "20197",
             "telegram_dm_topic_reply_fallback": True,

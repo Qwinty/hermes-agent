@@ -172,6 +172,49 @@ class TestGatewayEmptyModelFallback:
         assert kwargs["base_url"] == "http://127.0.0.1:8099/v1"
         assert kwargs["api_mode"] == "chat_completions"
 
+    def test_telegram_guest_mode_reasoning_effort_overrides_global(self):
+        """Telegram guest-mode calls can use a dedicated reasoning effort."""
+        from gateway.run import GatewayRunner
+
+        runner = object.__new__(GatewayRunner)
+        runner._session_reasoning_overrides = {}
+        user_config = {
+            "agent": {"reasoning_effort": "high"},
+            "telegram": {
+                "guest_mode_model": {
+                    "provider": "openai-codex",
+                    "model": "gpt-5.5",
+                    "reasoning_effort": "low",
+                },
+            },
+        }
+
+        reasoning = runner._resolve_session_reasoning_config(
+            user_config=user_config,
+            guest_mode_invocation=True,
+        )
+
+        assert reasoning == {"enabled": True, "effort": "low"}
+
+    def test_telegram_guest_mode_reasoning_effort_does_not_override_normal_calls(self):
+        """The dedicated guest reasoning level must not affect regular sessions."""
+        from gateway.run import GatewayRunner
+
+        runner = object.__new__(GatewayRunner)
+        runner._session_reasoning_overrides = {}
+        user_config = {
+            "agent": {"reasoning_effort": "high"},
+            "telegram": {"guest_mode_reasoning_effort": "low"},
+        }
+
+        with patch("gateway.run._load_gateway_runtime_config", return_value=user_config):
+            reasoning = runner._resolve_session_reasoning_config(
+                user_config=user_config,
+                guest_mode_invocation=False,
+            )
+
+        assert reasoning == {"enabled": True, "effort": "high"}
+
     def test_telegram_guest_mode_model_does_not_override_normal_calls(self):
         """The dedicated guest model must not affect regular Telegram sessions."""
         from gateway.run import GatewayRunner
