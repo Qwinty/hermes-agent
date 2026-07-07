@@ -253,7 +253,7 @@ _TELEGRAM_GUEST_UPDATE_TYPE = "guest_message"
 _TELEGRAM_GUEST_CHAT_PREFIX = "guest:"
 
 
-@dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True)
 class TelegramGuestContext:
     """Normalized Bot API 10.0 guest-message data.
 
