@@ -17490,6 +17490,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return self._is_session_run_current(session_key, run_generation)
         
         user_config = _load_gateway_config()
+        persist_user_message = None
+        persist_user_timestamp = None
+        moa_config = None
         platform_key = _platform_config_key(source.platform)
 
         from hermes_cli.tools_config import _get_platform_tools
@@ -17546,6 +17549,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else (_resolved_tp or _env_tp or "all")
         )
         progress_mode = _effective_tool_progress_mode(source, progress_mode)
+        progress_grouping = str(
+            resolve_display_setting(user_config, platform_key, "tool_progress_grouping", "editable")
+            or "editable"
+        ).strip().lower()
+        _voice_ack_guild = [None]
+        voice_ack_callback = None
         is_guest_turn = _is_telegram_guest_source(source)
         def _display_surface_mode(
             setting: str,
