@@ -372,7 +372,12 @@ def _handle_send(args):
         else:
             return tool_error(f"Platform '{platform_name}' is not configured. Set up credentials in ~/.hermes/config.yaml or environment variables.")
 
-    from gateway.platforms.base import BasePlatformAdapter
+    from gateway.platforms.base import (
+        BasePlatformAdapter,
+        MEDIA_EXTENSIONLESS_TAG_RE,
+        _normalize_media_tag_path,
+        _strip_media_directives,
+    )
 
     # Capture [[as_document]] directive before extract_media strips it.
     # Image-extension files in this batch will route through send_document
@@ -382,6 +387,32 @@ def _handle_send(args):
 
     media_files, cleaned_message = BasePlatformAdapter.extract_media(message)
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+
+    # Extensionless MEDIA tags are intentionally left in the body by
+    # extract_media(). If the file is safe and exists, deliver it as a document
+    # and remove the directive so it is not shown as visible text.
+    unknown_media_paths: list[str] = []
+    unknown_media_spans: list[tuple[int, int]] = []
+    for match in MEDIA_EXTENSIONLESS_TAG_RE.finditer(cleaned_message):
+        raw_path = _normalize_media_tag_path(match.group("path"))
+        if not raw_path:
+            continue
+        safe_path = BasePlatformAdapter.validate_media_delivery_path(raw_path)
+        if safe_path:
+            unknown_media_paths.append(safe_path)
+            unknown_media_spans.append(match.span())
+    if unknown_media_spans:
+        chars = list(cleaned_message)
+        for start, end in sorted(unknown_media_spans, reverse=True):
+            del chars[start:end]
+        cleaned_message = "".join(chars)
+
+    local_files, cleaned_message = BasePlatformAdapter.extract_local_files(cleaned_message)
+    cleaned_message = _strip_media_directives(cleaned_message).strip()
+    for local_path in unknown_media_paths:
+        media_files.append((local_path, False))
+    for local_path in BasePlatformAdapter.filter_local_delivery_paths(local_files):
+        media_files.append((local_path, False))
     mirror_text = cleaned_message.strip() or _describe_media_for_mirror(media_files)
 
     # If no thread_id was supplied in the target string, fall back to the
@@ -1174,8 +1205,12 @@ async def _send_telegram(
         send_text_separately = True
         if formatted.strip() and len(media_files) == 1:
             _media_ext = os.path.splitext(media_files[0][0])[1].lower()
-            if _media_ext in (_IMAGE_EXTS | _VIDEO_EXTS) and not force_document:
-                caption_for_single_media = formatted[:1024]
+            if (
+                _media_ext in (_IMAGE_EXTS | _VIDEO_EXTS)
+                and not force_document
+                and len(formatted) <= 1024
+            ):
+                caption_for_single_media = formatted
                 send_text_separately = False
 
         if send_text_separately and formatted.strip():

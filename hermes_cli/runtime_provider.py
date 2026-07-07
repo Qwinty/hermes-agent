@@ -713,6 +713,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                         "base_url": base_url.strip(),
                         "api_key": resolved_api_key,
                         "model": entry.get("default_model", ""),
+                        "preserve_provider_key_as_runtime": bool(entry.get("preserve_provider_key_as_runtime")) or (requested_norm.startswith("custom:") and _normalize_custom_provider_name(str(entry.get("name", "") or "")) == name_norm),
                     }
                     extra_body = entry.get("extra_body")
                     if isinstance(extra_body, dict):
@@ -744,6 +745,7 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                             "base_url": base_url.strip(),
                             "api_key": resolved_api_key,
                             "model": entry.get("default_model", ""),
+                            "preserve_provider_key_as_runtime": True,
                         }
                         extra_body = entry.get("extra_body")
                         if isinstance(extra_body, dict):
@@ -1057,7 +1059,7 @@ def _resolve_named_custom_runtime(
 
     provider_key = str(custom_provider.get("provider_key", "") or "").strip().lower()
     runtime_provider = "custom"
-    if provider_key:
+    if provider_key and custom_provider.get("preserve_provider_key_as_runtime"):
         try:
             import importlib
 
@@ -1761,21 +1763,32 @@ def resolve_runtime_provider(
                 or getattr(entry, "access_token", "")
             )
             # For Nous, the pool entry's runtime_api_key is the agent_key — a
-            # short-lived inference credential (~30 min TTL).  The pool doesn't
+            # short-lived inference credential (~30 min TTL). The pool doesn't
             # refresh it during selection (that would trigger network calls in
-            # non-runtime contexts like `hermes auth list`).  If the key is
-            # expired, clear pool_api_key so we fall through to
-            # resolve_nous_runtime_credentials() which handles refresh + fallback.
+            # non-runtime contexts like `hermes auth list`). If the key is
+            # expired, refresh the selected entry before falling through to
+            # singleton auth.
             if provider == "nous" and pool_api_key:
-                min_ttl = max(60, int(os.getenv("HERMES_NOUS_MIN_KEY_TTL_SECONDS", "1800")))
+                min_ttl = max(60, env_int("HERMES_NOUS_MIN_KEY_TTL_SECONDS", 1800))
                 nous_state = {
                     "agent_key": getattr(entry, "agent_key", None),
                     "agent_key_expires_at": getattr(entry, "agent_key_expires_at", None),
                     "scope": getattr(entry, "scope", None),
                 }
                 if not _agent_key_is_usable(nous_state, min_ttl):
-                    logger.debug("Nous pool entry agent_key expired/missing, falling through to runtime resolution")
-                    pool_api_key = ""
+                    logger.debug("Nous pool entry agent_key expired/missing, refreshing selected pool entry")
+                    try:
+                        refreshed = pool.try_refresh_current()
+                    except Exception:
+                        refreshed = None
+                    if refreshed is not None:
+                        entry = refreshed
+                        pool_api_key = (
+                            getattr(entry, "runtime_api_key", None)
+                            or getattr(entry, "access_token", "")
+                        )
+                    else:
+                        pool_api_key = ""
             if pool_api_key:
                 return _resolve_runtime_from_pool_entry(
                     provider=provider,
