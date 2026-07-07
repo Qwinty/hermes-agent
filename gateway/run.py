@@ -5597,6 +5597,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _event_can_join_startup_batch(cls, event: Optional[MessageEvent]) -> bool:
         return cls._event_has_batch_media(event) or cls._event_has_forwarded_text_context(event)
 
+    def _pop_adapter_pending_image_event(self, adapter: Any, session_key: str) -> Optional[MessageEvent]:
+        pending_messages = getattr(adapter, "_pending_messages", None)
+        if not pending_messages:
+            return None
+        pending_event = pending_messages.get(session_key)
+        if not self._event_can_join_startup_batch(pending_event):
+            return None
+        return pending_messages.pop(session_key, None)
+
     def _pop_adapter_pending_startup_event(self, adapter: Any, session_key: str) -> Optional[MessageEvent]:
         pending_messages = getattr(adapter, "_pending_messages", None)
         if not pending_messages:
@@ -11020,6 +11029,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         history = history or []
         message_text = event.text or ""
+        if getattr(event, "forward_origin", None):
+            forward_context = self._format_forward_origin_context(event.forward_origin)
+            if forward_context:
+                message_text = f"{forward_context}\n\n{message_text}" if message_text else forward_context
+                if getattr(event, "message_type", None) == MessageType.TEXT:
+                    try:
+                        event.forward_origin = None
+                    except Exception:
+                        pass
         _group_sessions_per_user = getattr(self.config, "group_sessions_per_user", True)
         _thread_sessions_per_user = getattr(self.config, "thread_sessions_per_user", False)
         # Prefer the already resolved session key from the caller so this write
@@ -11276,10 +11294,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 reply_context_parts.append(image_context)
             if reply_audio_paths:
-                audio_context, _ = await self._enrich_message_with_transcription(
+                _audio_result = await self._enrich_message_with_transcription(
                     "[The user replied to a message that contains voice/audio.]",
                     reply_audio_paths,
                 )
+                audio_context = _audio_result[0] if isinstance(_audio_result, tuple) else _audio_result
                 audio_context = audio_context.replace(
                     "[The user sent a voice message~",
                     "[The message the user replied to contains a voice message~",
@@ -11507,10 +11526,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
 
         session_key_override = str(getattr(event, "session_key_override", "") or "").strip() or None
-        session_entry = self.session_store.get_or_create_session(
-            source,
-            session_key_override=session_key_override,
-        )
+        if session_key_override:
+            session_entry = self.session_store.get_or_create_session(
+                source,
+                session_key_override=session_key_override,
+            )
+        else:
+            session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
         pinned_session_id = str(
             (getattr(event, "metadata", None) or {}).get("gateway_session_id") or ""

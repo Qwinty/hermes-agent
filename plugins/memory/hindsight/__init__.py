@@ -185,6 +185,25 @@ def _short_preview(text: str, limit: int = 240) -> str:
     return preview[: limit - 1] + "…"
 
 
+_PORT_HEALTH_GRACE_ENV = "HINDSIGHT_EMBED_PORT_HEALTH_GRACE_TIMEOUT"
+
+
+def _export_port_health_grace_timeout(config: dict[str, Any]) -> None:
+    """Export the embedded-daemon health grace timeout to the process env."""
+    raw = config.get("port_health_grace_timeout")
+    if raw is None or raw == "":
+        return
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("Invalid Hindsight port_health_grace_timeout %r; ignoring.", raw)
+        return
+    if seconds < 0:
+        logger.warning("Negative Hindsight port_health_grace_timeout %r; ignoring.", raw)
+        return
+    os.environ.setdefault(_PORT_HEALTH_GRACE_ENV, repr(seconds))
+
+
 def _check_local_runtime() -> tuple[bool, str | None]:
     """Return whether local embedded Hindsight imports cleanly.
 

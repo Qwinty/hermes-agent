@@ -1754,6 +1754,9 @@ class MessageEvent:
     reply_to_media_urls: List[str] = field(default_factory=list)
     reply_to_media_types: List[str] = field(default_factory=list)
 
+    # Forwarded-message metadata provided by adapters (Telegram forward_origin, etc.).
+    forward_origin: Optional[Dict[str, str]] = None
+
     # Optional session override for transports whose per-turn delivery id is
     # not the conversation id (e.g. Telegram Guest Bot guest_query_id).
     session_key_override: Optional[str] = None
@@ -2108,6 +2111,8 @@ def merge_pending_message_event(
             if incoming_has_media:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
+            if getattr(event, "forward_origin", None) and not getattr(existing, "forward_origin", None):
+                existing.forward_origin = event.forward_origin
             if event.text:
                 if existing.text:
                     existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
