@@ -135,6 +135,38 @@ def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
 
 
 
+
+def _resolve_plain_custom_api_mode(model_cfg: Dict[str, Any], base_url: str) -> str:
+    """Resolve api_mode for legacy/plain ``provider: custom`` endpoints."""
+    configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
+    detected_mode = _detect_api_mode_for_url(base_url)
+
+    if configured_mode == "codex_responses" and detected_mode != "codex_responses":
+        logger.info(
+            "Ignoring persisted custom api_mode=codex_responses for non-OpenAI endpoint %s",
+            base_url or "(unknown)",
+        )
+        configured_mode = None
+
+    return configured_mode or detected_mode or "chat_completions"
+
+
+def _anthropic_base_url_override_ok(base_url: str) -> bool:
+    """Return True when ``model.base_url`` plausibly speaks Anthropic Messages."""
+    candidate = (base_url or "").strip()
+    if not candidate:
+        return False
+    hostname = (base_url_hostname(candidate) or "").lower()
+    if not hostname:
+        return False
+    if hostname == "api.anthropic.com" or hostname.endswith(".anthropic.com") or hostname.endswith(".claude.com"):
+        return True
+    if hostname.endswith(".azure.com"):
+        return True
+    if _detect_api_mode_for_url(candidate) == "anthropic_messages":
+        return True
+    return False
+
 def _host_derived_api_key(base_url: str) -> str:
     """Look up `<VENDOR>_API_KEY` in env, derived from the base URL host."""
     hostname = base_url_hostname(base_url)
