@@ -784,6 +784,21 @@ CREATE TABLE IF NOT EXISTS gateway_session_reasoning_overrides (
     updated_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS gateway_routing (
+    scope TEXT NOT NULL DEFAULT '',
+    session_key TEXT NOT NULL,
+    entry_json TEXT NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (scope, session_key)
+);
+
+CREATE TABLE IF NOT EXISTS compression_locks (
+    session_id TEXT PRIMARY KEY,
+    holder TEXT NOT NULL,
+    acquired_at REAL NOT NULL,
+    expires_at REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -1216,6 +1231,13 @@ class SessionDB:
                         "WAL checkpoint: %d/%d pages checkpointed",
                         result[2], result[1],
                     )
+        except Exception:
+            pass  # Best effort — never fatal.
+
+    def _try_optimize_fts(self) -> None:
+        """Best-effort FTS5 segment merge. Never raises."""
+        try:
+            self.optimize_fts()
         except Exception:
             pass  # Best effort — never fatal.
 
