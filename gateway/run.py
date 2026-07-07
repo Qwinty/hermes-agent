@@ -3645,6 +3645,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "the session attached to the current topic."
         )
 
+    def _recover_telegram_topic_thread_id(
+        self,
+        source: SessionSource,
+    ) -> Optional[str]:
+        """Pin DM-topic routing to the user's last-active topic."""
+        if (
+            source.platform != Platform.TELEGRAM
+            or source.chat_type != "dm"
+            or not source.chat_id
+            or not source.user_id
+            or not self._telegram_topic_mode_enabled(source)
+        ):
+            return None
+        inbound = str(source.thread_id or "")
+        is_lobby = not inbound or inbound in self._TELEGRAM_GENERAL_TOPIC_IDS
+        if not is_lobby:
+            # A non-lobby, unknown thread_id is most likely the first message in
+            # a brand-new Telegram DM topic. Preserve it so it can be recorded
+            # as a new independent lane below instead of hijacking the latest
+            # existing topic binding.
+            return None
+        session_db = getattr(self, "_session_db", None)
+        if session_db is None:
+            return None
+        try:
+            bindings = session_db.list_telegram_topic_bindings_for_chat(
+                chat_id=str(source.chat_id),
+            )
+        except Exception:
+            logger.debug("topic-recover: read failed", exc_info=True)
+            return None
+        if not bindings:
+            return None
+        user_id = str(source.user_id)
+        for binding in bindings:  # newest-first
+            if str(binding.get("user_id") or "") == user_id:
+                recovered = str(binding.get("thread_id") or "")
+                if recovered and recovered != inbound:
+                    return recovered
+                return None
+        return None
+
     def _record_telegram_topic_binding(
         self,
         source: SessionSource,
@@ -12329,6 +12371,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return "\n".join(lines)
 
 
+    async def _handle_reset_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         # Snapshot the old entry so on_session_finalize can report the
         # expiring session id before reset_session() rotates it.
         old_entry = self.session_store._entries.get(session_key)
@@ -12572,6 +12615,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return matches
 
 
+
+    async def _handle_kanban_command(self, event: MessageEvent) -> str:
+        """Handle /kanban — delegate to the shared kanban CLI."""
+        import asyncio
+        import re
+        import shlex
+        from hermes_cli.kanban import run_slash
+
+        text = (event.text or "").strip()
+        # Strip the leading "/kanban" (with or without slash), leaving args.
+        if text.startswith("/"):
+            text = text.lstrip("/")
+        if text.startswith("kanban"):
+            text = text[len("kanban"):].lstrip()
+
+        tokens = shlex.split(text) if text else []
+        requested_board = None
+        action = None
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok == "--board":
+                if i + 1 >= len(tokens):
+                    break
+                requested_board = tokens[i + 1]
+                i += 2
+                continue
+            if tok.startswith("--board="):
+                requested_board = tok.split("=", 1)[1]
+                i += 1
+                continue
+            action = tok
+            break
+
+        is_create = action == "create"
+
+        try:
+            output = await asyncio.to_thread(run_slash, text)
+        except Exception as exc:  # pragma: no cover - defensive
+            return t("gateway.kanban.error_prefix", error=exc)
 
         # Auto-subscribe on create. Parse the task id from the CLI's standard
         # success line ("Created t_abcd  (ready, assignee=...)"). If the user
@@ -17775,6 +17858,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         progress_mode = _effective_tool_progress_mode(source, progress_mode)
         is_guest_turn = _is_telegram_guest_source(source)
+        def _display_surface_mode(
+            setting: str,
+            *,
+            default: bool = False,
+            require_platform_override_for: set[Any] | None = None,
+            allow_generic: bool = False,
+        ) -> str:
+            """Return off|raw|generic for a gateway visibility surface."""
+            if require_platform_override_for:
+                current_platform = _gateway_platform_value(source.platform)
+                platform_only = {
+                    _gateway_platform_value(item)
+                    for item in require_platform_override_for
+                }
+                if (
+                    current_platform in platform_only
+                    and not _has_platform_display_override(user_config, platform_key, setting)
+                ):
+                    return "off"
+            value = resolve_display_setting(user_config, platform_key, setting, default)
+            if isinstance(value, str) and value.strip().lower() == "generic":
+                return "generic" if allow_generic else "off"
+            return "raw" if bool(value) else "off"
+
         # Disable tool progress for webhooks - they don't support message editing,
         # so each progress line would be sent as a separate message.
         from gateway.config import Platform

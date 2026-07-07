@@ -6,6 +6,7 @@ import logging
 import os
 import re
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -132,6 +133,30 @@ def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
         return "anthropic_messages"
     return None
 
+
+
+def _host_derived_api_key(base_url: str) -> str:
+    """Look up `<VENDOR>_API_KEY` in env, derived from the base URL host."""
+    hostname = base_url_hostname(base_url)
+    if not hostname:
+        return ""
+    # Reject IPv4 / IPv6 / loopback — no meaningful vendor label.
+    if any(ch.isdigit() for ch in hostname.split(".")[-1]):
+        return ""
+    if hostname in ("localhost",) or ":" in hostname:
+        return ""
+    labels = [label for label in hostname.split(".") if label]
+    while labels and labels[0] in ("api", "www"):
+        labels.pop(0)
+    if len(labels) < 2:
+        return ""
+    vendor = labels[-2]
+    sanitized = "".join(ch if ch.isalnum() else "_" for ch in vendor).upper()
+    if not sanitized or not sanitized[0].isalpha():
+        return ""
+    if sanitized in ("OPENAI", "OPENROUTER", "OLLAMA"):
+        return ""
+    return (_getenv(f"{sanitized}_API_KEY", "") or "").strip()
 
 def _epoch_seconds(value: Any) -> Optional[float]:
     if value is None:
