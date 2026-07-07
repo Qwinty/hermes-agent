@@ -3645,6 +3645,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
         return None
 
+    def _normalize_source_for_session_key(self, source: SessionSource) -> SessionSource:
+        """Return the source shape used by normal message turns before session-key lookup."""
+        try:
+            recovered = self._recover_telegram_topic_thread_id(source)
+        except Exception:
+            logger.debug("topic-recover: normalize failed", exc_info=True)
+            return source
+        if recovered is None:
+            return source
+        try:
+            return dataclasses.replace(source, thread_id=recovered)
+        except Exception:
+            logger.debug("topic-recover: normalize replace failed", exc_info=True)
+            return source
+
     def _record_telegram_topic_binding(
         self,
         source: SessionSource,
