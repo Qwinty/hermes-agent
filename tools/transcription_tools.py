@@ -1547,7 +1547,7 @@ def _transcribe_deepgram(file_path: str, model_name: str) -> Dict[str, Any]:
             "Transcribed %s via Deepgram (%s, lang=%s, %d chars)",
             Path(file_path).name,
             model_name,
-            language or result.get("results", {}).get("language")
+            language or result.get("results", {}).get("language"),
             len(transcript_text),
         )
         return {"success": True, "transcript": transcript_text, "provider": "deepgram"}
