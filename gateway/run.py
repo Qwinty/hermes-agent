@@ -15428,7 +15428,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         title: str,
     ) -> None:
         """Best-effort rename of a Telegram DM topic when Hermes auto-titles a session."""
-        if not await asyncio.to_thread(self._is_telegram_topic_lane, source) or not source.chat_id or not source.thread_id:
+        is_topic_lane = await asyncio.to_thread(self._is_telegram_topic_lane, source)
+        if not is_topic_lane or not source.chat_id or not source.thread_id:
+            logger.info(
+                "Telegram topic title rename skipped before adapter call: "
+                "session_id=%s chat_id=%s thread_id=%s chat_type=%s is_topic_lane=%s title_present=%s",
+                session_id,
+                source.chat_id,
+                source.thread_id,
+                source.chat_type,
+                is_topic_lane,
+                bool(title),
+            )
             return
 
         # Operator can fully disable per-topic auto-rename via
@@ -15436,6 +15447,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # by the user (ad-hoc Threaded Mode) and auto-rename would
         # overwrite their chosen names every time the auto-title fires.
         if self._telegram_topic_auto_rename_disabled(source):
+            logger.info(
+                "Telegram topic title rename skipped because auto-rename is disabled: "
+                "session_id=%s chat_id=%s thread_id=%s",
+                session_id,
+                source.chat_id,
+                source.thread_id,
+            )
             return
 
         # Skip rename when the topic is operator-declared via
@@ -15459,6 +15477,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # shouldn't count, and cached ad-hoc topic-mode lanes return a
                 # private ``_synthetic`` marker so they can still be renamed.
                 if isinstance(operator_topic, dict) and not operator_topic.get("_synthetic"):
+                    logger.info(
+                        "Telegram topic title rename skipped for operator-declared topic: "
+                        "session_id=%s chat_id=%s thread_id=%s topic=%s",
+                        session_id,
+                        source.chat_id,
+                        source.thread_id,
+                        operator_topic.get("name"),
+                    )
                     return
 
         session_db = getattr(self, "_session_db", None)
@@ -15469,12 +15495,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     thread_id=str(source.thread_id),
                 )
                 if binding and str(binding.get("session_id") or "") != str(session_id):
+                    logger.info(
+                        "Telegram topic title rename skipped because topic binding points elsewhere: "
+                        "session_id=%s bound_session_id=%s chat_id=%s thread_id=%s",
+                        session_id,
+                        binding.get("session_id"),
+                        source.chat_id,
+                        source.thread_id,
+                    )
                     return
             except Exception:
                 logger.debug("Failed to verify Telegram topic binding before rename", exc_info=True)
                 return
 
         if adapter is None:
+            logger.info(
+                "Telegram topic title rename skipped because adapter is unavailable: "
+                "session_id=%s platform=%s chat_id=%s thread_id=%s",
+                session_id,
+                source.platform,
+                source.chat_id,
+                source.thread_id,
+            )
             return
         topic_name = self._sanitize_telegram_topic_title(title)
         try:
@@ -15492,6 +15534,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if edit_forum_topic is None:
                 edit_forum_topic = getattr(bot, "editForumTopic", None) if bot is not None else None
             if edit_forum_topic is None:
+                logger.info(
+                    "Telegram topic title rename skipped because edit_forum_topic is unavailable: "
+                    "session_id=%s chat_id=%s thread_id=%s",
+                    session_id,
+                    source.chat_id,
+                    source.thread_id,
+                )
                 return
             try:
                 await edit_forum_topic(
@@ -15506,7 +15555,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     name=topic_name,
                 )
         except Exception:
-            logger.debug("Failed to rename Telegram topic for auto-generated title", exc_info=True)
+            logger.info(
+                "Telegram topic title rename failed during adapter call: "
+                "session_id=%s chat_id=%s thread_id=%s",
+                session_id,
+                source.chat_id,
+                source.thread_id,
+                exc_info=True,
+            )
 
     def _telegram_topic_auto_rename_disabled(self, source: SessionSource) -> bool:
         """Return True when operator disabled per-topic auto-rename for this Telegram chat.
@@ -15538,15 +15594,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         title: str,
     ) -> None:
         """Schedule a topic rename from the auto-title background thread."""
-        if not title or not self._is_telegram_topic_lane(source):
+        is_topic_lane = self._is_telegram_topic_lane(source)
+        logger.info(
+            "Telegram topic title rename scheduling check: "
+            "session_id=%s chat_id=%s thread_id=%s chat_type=%s is_topic_lane=%s title_present=%s",
+            session_id,
+            source.chat_id,
+            source.thread_id,
+            source.chat_type,
+            is_topic_lane,
+            bool(title),
+        )
+        if not title or not is_topic_lane:
             return
         if self._telegram_topic_auto_rename_disabled(source):
+            logger.info(
+                "Telegram topic title rename not scheduled because auto-rename is disabled: "
+                "session_id=%s chat_id=%s thread_id=%s",
+                session_id,
+                source.chat_id,
+                source.thread_id,
+            )
             return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = getattr(self, "_gateway_loop", None)
         if loop is None or loop.is_closed():
+            logger.info(
+                "Telegram topic title rename not scheduled because gateway loop is unavailable: "
+                "session_id=%s chat_id=%s thread_id=%s loop_present=%s loop_closed=%s",
+                session_id,
+                source.chat_id,
+                source.thread_id,
+                loop is not None,
+                bool(loop and loop.is_closed()),
+            )
             return
         try:
             copied_source = dataclasses.replace(source)
