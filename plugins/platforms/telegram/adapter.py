@@ -9190,7 +9190,12 @@ class TelegramAdapter(BasePlatformAdapter):
                         for t in chat_entry.get("topics", []):
                             if t.get("name") == topic_name:
                                 return t
-                return {"name": topic_name}
+                # This is a best-effort cache entry discovered from a live
+                # message, not an operator-declared ``extra.dm_topics`` entry.
+                # Keep returning topic metadata for prompt/skill lookup, but
+                # mark it synthetic so gateway auto-rename can distinguish
+                # ad-hoc topic-mode lanes from fixed configured topics.
+                return {"name": topic_name, "_synthetic": True}
 
         # Not in cache — hot-reload config in case topics were added externally
         self._reload_dm_topics_from_config()
@@ -9204,7 +9209,9 @@ class TelegramAdapter(BasePlatformAdapter):
                         for t in chat_entry.get("topics", []):
                             if t.get("name") == topic_name:
                                 return t
-                return {"name": topic_name}
+                # See the cached-topic branch above: this entry is synthetic
+                # when it was not found in ``_dm_topics_config``.
+                return {"name": topic_name, "_synthetic": True}
 
         return None
 

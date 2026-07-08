@@ -15454,9 +15454,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     operator_topic = get_info(adapter, str(source.chat_id), str(source.thread_id))
                 except Exception:
                     operator_topic = None
-                # Only treat dict-shaped returns as operator-declared; a
-                # bare MagicMock or other sentinel shouldn't count.
-                if isinstance(operator_topic, dict):
+                # Only treat non-synthetic dict-shaped returns as
+                # operator-declared; a bare MagicMock or other sentinel
+                # shouldn't count, and cached ad-hoc topic-mode lanes return a
+                # private ``_synthetic`` marker so they can still be renamed.
+                if isinstance(operator_topic, dict) and not operator_topic.get("_synthetic"):
                     return
 
         session_db = getattr(self, "_session_db", None)

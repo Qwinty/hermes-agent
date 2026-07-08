@@ -453,6 +453,19 @@ def test_get_dm_topic_info_returns_none_for_unknown():
     assert result is None
 
 
+def test_get_dm_topic_info_marks_cached_topic_without_config_synthetic():
+    """Cached ad-hoc topic-mode lanes are not operator-declared config topics."""
+    adapter = _make_adapter()
+    adapter._dm_topics["111:Ad hoc"] = 100
+    adapter._reload_dm_topics_from_config = lambda: None
+
+    result = adapter._get_dm_topic_info("111", "100")
+
+    assert result is not None
+    assert result["name"] == "Ad hoc"
+    assert result["_synthetic"] is True
+
+
 def test_get_dm_topic_info_returns_none_without_config():
     """Should return None if no dm_topics config."""
     adapter = _make_adapter()
