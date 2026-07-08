@@ -7,6 +7,7 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/responses/{response_id} — Retrieve a stored response
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent and any configured model_routes aliases
+- GET  /api/model/options          — dashboard-compatible provider/model picker payload
 - GET  /v1/capabilities            — machine-readable API capabilities for external UIs
 - GET  /api/sessions               — list client-visible Hermes sessions
 - POST /api/sessions               — create an empty Hermes session
@@ -61,6 +62,7 @@ from gateway.platforms.base import (
     validate_media_delivery_path,
 )
 from agent.redact import redact_sensitive_text
+from hermes_cli.inventory import build_models_payload, load_picker_context
 
 logger = logging.getLogger(__name__)
 
@@ -1453,6 +1455,39 @@ class APIServerAdapter(BasePlatformAdapter):
             })
 
         return web.json_response({"object": "list", "data": models})
+
+    async def _handle_model_options(self, request: "web.Request") -> "web.Response":
+        """GET /api/model/options — return dashboard-compatible model picker data.
+
+        Browser clients use this richer catalog when /v1/models only advertises
+        the synthetic OpenAI-compatible Hermes model alias.  The payload mirrors
+        the dashboard/TUI model inventory shape but stays read-only and strips no
+        additional secrets because the shared inventory builder never includes
+        provider credentials.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        refresh = _coerce_request_bool(request.query.get("refresh"), default=False)
+        try:
+            ctx = load_picker_context()
+            payload = build_models_payload(
+                ctx,
+                capabilities=True,
+                max_models=None,
+                probe_custom_providers=refresh,
+                probe_current_custom_provider=True,
+                refresh=refresh,
+            )
+        except Exception:
+            logger.exception("GET /api/model/options failed")
+            return web.json_response(
+                _openai_error("Failed to enumerate model options", err_type="server_error"),
+                status=500,
+            )
+
+        return web.json_response(payload)
 
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
         """GET /v1/capabilities — advertise the stable API surface.
@@ -4811,6 +4846,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/health/detailed", self._handle_health_detailed)
             self._app.router.add_get("/v1/health", self._handle_health)
             self._app.router.add_get("/v1/models", self._handle_models)
+            self._app.router.add_get("/api/model/options", self._handle_model_options)
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
             self._app.router.add_get("/v1/skills", self._handle_skills)
             self._app.router.add_get("/v1/toolsets", self._handle_toolsets)

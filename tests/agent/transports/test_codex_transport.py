@@ -492,6 +492,27 @@ class TestCodexBuildKwargs:
         )
         assert kw.get("reasoning") == {"effort": "low"}
 
+    def test_xai_grok_4_3_keeps_reasoning_effort(self, transport):
+        """grok-4.3 accepts reasoning.effort (low/medium/high)."""
+        messages = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="grok-4.3", messages=messages, tools=[],
+            is_xai_responses=True,
+            reasoning_config={"effort": "medium"},
+        )
+        assert kw.get("reasoning") == {"effort": "medium"}
+
+    def test_xai_grok_4_5_keeps_reasoning_effort(self, transport):
+        """grok-4.5 accepts reasoning.effort (low/medium/high; default high)."""
+        messages = [{"role": "user", "content": "Hi"}]
+        for model in ("grok-4.5", "x-ai/grok-4.5", "xai/grok-4.5"):
+            kw = transport.build_kwargs(
+                model=model, messages=messages, tools=[],
+                is_xai_responses=True,
+                reasoning_config={"effort": "high"},
+            )
+            assert kw.get("reasoning") == {"effort": "high"}, model
+
     def test_xai_grok_code_fast_omits_reasoning_effort(self, transport):
         """grok-code-fast-1 rejects reasoning.effort."""
         messages = [{"role": "user", "content": "Hi"}]

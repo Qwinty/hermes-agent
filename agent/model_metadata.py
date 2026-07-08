@@ -333,10 +333,11 @@ DEFAULT_CONTEXT_LENGTHS = {
 }
 
 # xAI Grok models that ACCEPT the `reasoning.effort` parameter on
-# api.x.ai. Verified live against /v1/responses 2026-05-10:
+# api.x.ai. Verified live against /v1/responses 2026-05-10, extended for
+# grok-4.5 (docs + CPA catalog 2026-07-08):
 #
 #   ACCEPTS effort:  grok-3-mini, grok-3-mini-fast, grok-4.20-multi-agent-0309,
-#                    grok-4.3
+#                    grok-4.3, grok-4.5
 #   REJECTS effort:  grok-3, grok-4, grok-4-0709, grok-4-fast-(non-)reasoning,
 #                    grok-4-1-fast-(non-)reasoning, grok-4.20-0309-(non-)reasoning,
 #                    grok-code-fast-1
@@ -345,6 +346,9 @@ DEFAULT_CONTEXT_LENGTHS = {
 # effort dial — so callers should send no `reasoning` key at all rather
 # than a default `medium` (which 400s with "Model X does not support
 # parameter reasoningEffort").
+#
+# Grok 4.5 official dial: low | medium | high (default high; cannot disable).
+# Grok 4.20 multi-agent also accepts xhigh (agent count, not depth).
 _GROK_EFFORT_CAPABLE_PREFIXES = (
     "grok-3-mini",
     "grok-4.20-multi-agent",
