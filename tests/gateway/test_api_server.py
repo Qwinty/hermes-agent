@@ -846,6 +846,80 @@ class TestModelsEndpoint:
 
 
 # ---------------------------------------------------------------------------
+# /api/model/options endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestModelOptionsEndpoint:
+    @pytest.mark.asyncio
+    async def test_model_options_returns_picker_payload(self, adapter):
+        app = _create_app(adapter)
+        payload = {
+            "providers": [
+                {
+                    "slug": "cliproxyapi",
+                    "name": "CLIProxyAPI",
+                    "models": ["gpt-5.5", "gemini-3.5-flash-high"],
+                    "total_models": 2,
+                    "capabilities": {
+                        "gpt-5.5": {"fast": False, "reasoning": True},
+                    },
+                }
+            ],
+            "model": "gpt-5.5",
+            "provider": "cliproxyapi",
+        }
+
+        with patch("gateway.platforms.api_server.load_picker_context") as load_ctx, patch(
+            "gateway.platforms.api_server.build_models_payload",
+            return_value=payload,
+        ) as build_payload:
+            load_ctx.return_value = MagicMock()
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/api/model/options")
+                assert resp.status == 200
+                data = await resp.json()
+
+        assert data == payload
+        build_payload.assert_called_once_with(
+            load_ctx.return_value,
+            capabilities=True,
+            max_models=None,
+            probe_custom_providers=False,
+            probe_current_custom_provider=True,
+            refresh=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_model_options_refresh_probes_all_custom_providers(self, adapter):
+        app = _create_app(adapter)
+        with patch("gateway.platforms.api_server.load_picker_context") as load_ctx, patch(
+            "gateway.platforms.api_server.build_models_payload",
+            return_value={"providers": [], "model": "", "provider": ""},
+        ) as build_payload:
+            load_ctx.return_value = MagicMock()
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/api/model/options?refresh=true")
+                assert resp.status == 200
+
+        build_payload.assert_called_once_with(
+            load_ctx.return_value,
+            capabilities=True,
+            max_models=None,
+            probe_custom_providers=True,
+            probe_current_custom_provider=True,
+            refresh=True,
+        )
+
+    @pytest.mark.asyncio
+    async def test_model_options_requires_auth(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get("/api/model/options")
+            assert resp.status == 401
+
+
+# ---------------------------------------------------------------------------
 # /v1/capabilities endpoint
 # ---------------------------------------------------------------------------
 
