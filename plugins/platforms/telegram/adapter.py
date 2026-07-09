@@ -6595,12 +6595,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 reply_to_mode=self._reply_to_mode
             )
 
-            with open(file_path, "rb") as f:
+            if self.config.extra.get("local_mode"):
                 msg = await self._send_with_dm_topic_reply_anchor_retry(
                     self._bot.send_document,
                     {
                         "chat_id": normalize_telegram_chat_id(chat_id),
-                        "document": f,
+                        "document": file_path,
                         "filename": display_name,
                         "caption": caption[:1024] if caption else None,
                         "reply_to_message_id": reply_to_id,
@@ -6610,8 +6610,26 @@ class TelegramAdapter(BasePlatformAdapter):
                     metadata,
                     reply_to_id,
                     "document",
-                    reset_media=lambda: f.seek(0),
+                    reset_media=None,
                 )
+            else:
+                with open(file_path, "rb") as f:
+                    msg = await self._send_with_dm_topic_reply_anchor_retry(
+                        self._bot.send_document,
+                        {
+                            "chat_id": normalize_telegram_chat_id(chat_id),
+                            "document": f,
+                            "filename": display_name,
+                            "caption": caption[:1024] if caption else None,
+                            "reply_to_message_id": reply_to_id,
+                            **thread_kwargs,
+                            **self._notification_kwargs(metadata),
+                        },
+                        metadata,
+                        reply_to_id,
+                        "document",
+                        reset_media=lambda: f.seek(0),
+                    )
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             logger.warning(

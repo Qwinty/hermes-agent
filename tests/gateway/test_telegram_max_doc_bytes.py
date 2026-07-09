@@ -6,6 +6,8 @@ of `extra.base_url` as the explicit opt-in to the higher cap.
 """
 
 import sys
+import asyncio
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from gateway.config import PlatformConfig
@@ -54,3 +56,33 @@ def test_max_doc_bytes_empty_base_url_keeps_default():
         PlatformConfig(enabled=True, token="***", extra={"base_url": ""}),
     )
     assert adapter._max_doc_bytes == 20 * 1024 * 1024
+
+
+def test_local_mode_send_document_passes_path_to_bot(tmp_path):
+    media_path = tmp_path / "large.zip"
+    media_path.write_bytes(b"x")
+    adapter = TelegramAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="***",
+            extra={
+                "base_url": "http://localhost:8081/bot",
+                "local_mode": True,
+            },
+        )
+    )
+    adapter._bot = SimpleNamespace(send_document=object())
+    captured = {}
+
+    async def fake_send(send_func, kwargs, metadata, reply_to_id, kind, reset_media=None):
+        captured.update(kwargs)
+        captured["reset_media"] = reset_media
+        return SimpleNamespace(message_id=123)
+
+    adapter._send_with_dm_topic_reply_anchor_retry = fake_send
+
+    result = asyncio.run(adapter.send_document("273403055", str(media_path)))
+
+    assert result.success is True
+    assert captured["document"] == str(media_path)
+    assert captured["reset_media"] is None

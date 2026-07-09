@@ -872,7 +872,8 @@ async def _send_to_platform(
     # limit (issue #28557). Pass the whole message in one call; media attaches
     # after all text chunks.
     if platform == Platform.TELEGRAM:
-        disable_link_previews = bool(getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews"))
+        telegram_extra = getattr(pconfig, "extra", {}) or {}
+        disable_link_previews = bool(telegram_extra.get("disable_link_previews"))
         return await _send_telegram(
             pconfig.token,
             chat_id,
@@ -882,6 +883,9 @@ async def _send_to_platform(
             direct_messages_topic_id=direct_messages_topic_id,
             disable_link_previews=disable_link_previews,
             force_document=force_document,
+            base_url=telegram_extra.get("base_url"),
+            base_file_url=telegram_extra.get("base_file_url"),
+            local_mode=bool(telegram_extra.get("local_mode")),
         )
 
     # --- Discord: chunked delivery via the registry's standalone_sender_fn.
@@ -1105,6 +1109,9 @@ async def _send_telegram(
     direct_messages_topic_id=None,
     disable_link_previews=False,
     force_document=False,
+    base_url=None,
+    base_file_url=None,
+    local_mode=False,
 ):
     """Send via Telegram Bot API (one-shot, no polling needed).
 
@@ -1149,16 +1156,36 @@ async def _send_telegram(
             try:
                 from telegram.request import HTTPXRequest
                 logger.info("send_message: standalone Telegram send routed through proxy %s", _tg_proxy)
+                bot_kwargs = {
+                    "token": token,
+                    "request": HTTPXRequest(proxy=_tg_proxy),
+                    "get_updates_request": HTTPXRequest(proxy=_tg_proxy),
+                }
+                if base_url:
+                    bot_kwargs["base_url"] = base_url
+                    bot_kwargs["base_file_url"] = base_file_url or base_url
+                if local_mode:
+                    bot_kwargs["local_mode"] = True
                 bot = Bot(
-                    token=token,
-                    request=HTTPXRequest(proxy=_tg_proxy),
-                    get_updates_request=HTTPXRequest(proxy=_tg_proxy),
+                    **bot_kwargs,
                 )
             except Exception as _proxy_err:
                 logger.warning("send_message: failed to attach Telegram proxy (%s), falling back to direct connection", _proxy_err)
-                bot = Bot(token=token)
+                bot_kwargs = {"token": token}
+                if base_url:
+                    bot_kwargs["base_url"] = base_url
+                    bot_kwargs["base_file_url"] = base_file_url or base_url
+                if local_mode:
+                    bot_kwargs["local_mode"] = True
+                bot = Bot(**bot_kwargs)
         else:
-            bot = Bot(token=token)
+            bot_kwargs = {"token": token}
+            if base_url:
+                bot_kwargs["base_url"] = base_url
+                bot_kwargs["base_file_url"] = base_file_url or base_url
+            if local_mode:
+                bot_kwargs["local_mode"] = True
+            bot = Bot(**bot_kwargs)
         from plugins.platforms.telegram.telegram_ids import (
             normalize_telegram_chat_id,
         )
@@ -1278,31 +1305,37 @@ async def _send_telegram(
 
             ext = os.path.splitext(media_path)[1].lower()
             try:
-                with open(media_path, "rb") as f:
+                async def _send_media_payload(payload, media_kwargs):
+                    if ext in _IMAGE_EXTS and not force_document:
+                        return await bot.send_photo(
+                            chat_id=int_chat_id, photo=payload, **media_kwargs
+                        )
+                    if ext in _VIDEO_EXTS:
+                        return await bot.send_video(
+                            chat_id=int_chat_id, video=payload, **media_kwargs
+                        )
+                    if ext in _VOICE_EXTS and is_voice:
+                        return await bot.send_voice(
+                            chat_id=int_chat_id, voice=payload, **media_kwargs
+                        )
+                    if ext in _TELEGRAM_SEND_AUDIO_EXTS:
+                        return await bot.send_audio(
+                            chat_id=int_chat_id, audio=payload, **media_kwargs
+                        )
+                    return await bot.send_document(
+                        chat_id=int_chat_id, document=payload, **media_kwargs
+                    )
+
+                def _reset_payload(payload):
+                    if hasattr(payload, "seek"):
+                        payload.seek(0)
+
+                if local_mode:
                     media_kwargs = dict(thread_kwargs)
                     if caption_for_single_media and ext in (_IMAGE_EXTS | _VIDEO_EXTS):
                         media_kwargs.update(caption=caption_for_single_media, parse_mode=send_parse_mode)
                     try:
-                        if ext in _IMAGE_EXTS and not force_document:
-                            last_msg = await bot.send_photo(
-                                chat_id=int_chat_id, photo=f, **media_kwargs
-                            )
-                        elif ext in _VIDEO_EXTS:
-                            last_msg = await bot.send_video(
-                                chat_id=int_chat_id, video=f, **media_kwargs
-                            )
-                        elif ext in _VOICE_EXTS and is_voice:
-                            last_msg = await bot.send_voice(
-                                chat_id=int_chat_id, voice=f, **media_kwargs
-                            )
-                        elif ext in _TELEGRAM_SEND_AUDIO_EXTS:
-                            last_msg = await bot.send_audio(
-                                chat_id=int_chat_id, audio=f, **media_kwargs
-                            )
-                        else:
-                            last_msg = await bot.send_document(
-                                chat_id=int_chat_id, document=f, **media_kwargs
-                            )
+                        last_msg = await _send_media_payload(media_path, media_kwargs)
                     except Exception as media_err:
                         if _is_telegram_thread_not_found(media_err) and media_kwargs.get("message_thread_id"):
                             # Thread not found for media — retry without
@@ -1311,31 +1344,31 @@ async def _send_telegram(
                                 "Thread %s not found for media send, retrying without message_thread_id",
                                 media_kwargs["message_thread_id"],
                             )
-                            # Re-seek the file since the first attempt consumed it
-                            f.seek(0)
                             media_kwargs.pop("message_thread_id", None)
-                            if ext in _IMAGE_EXTS and not force_document:
-                                last_msg = await bot.send_photo(
-                                    chat_id=int_chat_id, photo=f, **media_kwargs
-                                )
-                            elif ext in _VIDEO_EXTS:
-                                last_msg = await bot.send_video(
-                                    chat_id=int_chat_id, video=f, **media_kwargs
-                                )
-                            elif ext in _VOICE_EXTS and is_voice:
-                                last_msg = await bot.send_voice(
-                                    chat_id=int_chat_id, voice=f, **media_kwargs
-                                )
-                            elif ext in _TELEGRAM_SEND_AUDIO_EXTS:
-                                last_msg = await bot.send_audio(
-                                    chat_id=int_chat_id, audio=f, **media_kwargs
-                                )
-                            else:
-                                last_msg = await bot.send_document(
-                                    chat_id=int_chat_id, document=f, **media_kwargs
-                                )
+                            last_msg = await _send_media_payload(media_path, media_kwargs)
                         else:
                             raise
+                else:
+                    with open(media_path, "rb") as f:
+                        media_kwargs = dict(thread_kwargs)
+                        if caption_for_single_media and ext in (_IMAGE_EXTS | _VIDEO_EXTS):
+                            media_kwargs.update(caption=caption_for_single_media, parse_mode=send_parse_mode)
+                        try:
+                            last_msg = await _send_media_payload(f, media_kwargs)
+                        except Exception as media_err:
+                            if _is_telegram_thread_not_found(media_err) and media_kwargs.get("message_thread_id"):
+                                # Thread not found for media — retry without
+                                # message_thread_id (issue #27012).
+                                logger.warning(
+                                    "Thread %s not found for media send, retrying without message_thread_id",
+                                    media_kwargs["message_thread_id"],
+                                )
+                                # Re-seek the file since the first attempt consumed it
+                                _reset_payload(f)
+                                media_kwargs.pop("message_thread_id", None)
+                                last_msg = await _send_media_payload(f, media_kwargs)
+                            else:
+                                raise
             except Exception as e:
                 warning = _sanitize_error_text(f"Failed to send media {media_path}: {e}")
                 logger.error(warning)
