@@ -974,6 +974,44 @@ class TestSendVideo:
         assert result.success is True
         assert result.message_id == "200"
         connected_adapter._bot.send_video.assert_called_once()
+        call_kwargs = connected_adapter._bot.send_video.call_args[1]
+        assert call_kwargs["supports_streaming"] is True
+        assert getattr(call_kwargs["video"], "name", None) == str(test_file)
+
+    @pytest.mark.asyncio
+    async def test_send_video_local_mode_passes_path_and_metadata(self, connected_adapter, tmp_path, monkeypatch):
+        test_file = tmp_path / "clip.mp4"
+        test_file.write_bytes(b"\x00\x00\x00\x1c" + b"ftyp" + b"\x00" * 100)
+        thumb = tmp_path / "thumb.jpg"
+        thumb.write_bytes(b"jpeg")
+        connected_adapter.config.extra["local_mode"] = True
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter._probe_video_metadata",
+            lambda path: {"width": 1920, "height": 1080, "duration": 42},
+        )
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter._ensure_video_thumbnail",
+            lambda path: str(thumb),
+        )
+
+        mock_msg = MagicMock()
+        mock_msg.message_id = 202
+        connected_adapter._bot.send_video = AsyncMock(return_value=mock_msg)
+
+        result = await connected_adapter.send_video(
+            chat_id="12345",
+            video_path=str(test_file),
+            caption="Check this out",
+        )
+
+        assert result.success is True
+        call_kwargs = connected_adapter._bot.send_video.call_args[1]
+        assert call_kwargs["video"] == str(test_file)
+        assert call_kwargs["thumbnail"] == str(thumb)
+        assert call_kwargs["supports_streaming"] is True
+        assert call_kwargs["width"] == 1920
+        assert call_kwargs["height"] == 1080
+        assert call_kwargs["duration"] == 42
 
     @pytest.mark.asyncio
     async def test_send_video_file_not_found(self, connected_adapter):
