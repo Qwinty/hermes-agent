@@ -1265,17 +1265,9 @@ class HindsightMemoryProvider(MemoryProvider):
         update_config: Any = getattr(banks, "update_bank_config", None)
         if not callable(update_config):
             raise AttributeError("Hindsight client does not expose banks.update_bank_config")
-        # hindsight_client_api is only present when the optional hindsight extra is
-        # installed. Tests mock banks.update_bank_config and assert on `.updates`,
-        # so fall back to a lightweight request object when the package is absent.
-        try:
-            from hindsight_client_api.models.bank_config_update import BankConfigUpdate
-        except ImportError:  # pragma: no cover - exercised when optional dep missing
-            from types import SimpleNamespace
+        from hindsight_client_api.models.bank_config_update import BankConfigUpdate
 
-            request: Any = SimpleNamespace(updates=dict(updates))
-        else:
-            request = BankConfigUpdate(updates=updates)
+        request = BankConfigUpdate(updates=updates)
         return _hindsight_response_dict(
             await update_config(
                 self._bank_id,
