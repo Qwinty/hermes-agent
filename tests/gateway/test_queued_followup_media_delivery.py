@@ -89,3 +89,27 @@ async def test_queued_first_response_all_media_sends_no_empty_text(tmp_path):
     adapter.send.assert_not_awaited()
     adapter.send_document.assert_awaited_once()
     assert adapter.send_document.await_args.kwargs["file_path"] == str(html)
+
+
+@pytest.mark.asyncio
+async def test_queued_first_response_preserves_remote_image_delivery():
+    adapter = _adapter()
+    adapter.extract_images = BasePlatformAdapter.extract_images
+
+    await _runner()._send_queued_first_response(
+        "Chart ready.\n\n![usage chart](https://example.com/usage.png)",
+        _event(),
+        adapter,
+        metadata={"thread_id": "374476"},
+    )
+
+    adapter.send.assert_awaited_once_with(
+        "273403055",
+        "Chart ready.",
+        metadata={"thread_id": "374476"},
+    )
+    adapter.send_multiple_images.assert_awaited_once_with(
+        chat_id="273403055",
+        images=[("https://example.com/usage.png", "usage chart")],
+        metadata={"thread_id": "374476"},
+    )

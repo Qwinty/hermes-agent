@@ -12653,7 +12653,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # extract_local_files scanned text that still contained MEDIA: tags,
             # producing false-positive bare-path matches with the MEDIA: prefix
             # glued on. This matches the chain order in gateway/platforms/base.py.
-            _, cleaned = adapter.extract_images(cleaned)
+            remote_images, cleaned = adapter.extract_images(cleaned)
             local_files, _ = adapter.extract_local_files(cleaned)
             local_files = BasePlatformAdapter.filter_local_delivery_paths(local_files)
 
@@ -12685,12 +12685,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     non_image_local.append(file_path)
 
-            if image_paths:
+            image_batch = list(remote_images or [])
+            image_batch.extend((f"file://{_quote(p)}", "") for p in image_paths)
+            if image_batch:
                 try:
-                    images = [(f"file://{_quote(p)}", "") for p in image_paths]
                     await adapter.send_multiple_images(
                         chat_id=event.source.chat_id,
-                        images=images,
+                        images=image_batch,
                         metadata=_thread_meta,
                     )
                 except Exception as e:
