@@ -8401,14 +8401,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _startup_media_grace_seconds() -> float:
-        raw = os.getenv("HERMES_TELEGRAM_STARTUP_MEDIA_GRACE_SECONDS", "1.0")
-        try:
-            value = float(raw)
-        except (TypeError, ValueError):
-            value = 1.0
-        if not math.isfinite(value):
-            value = 1.0
-        return max(0.0, min(value, 3.0))
+        return 1.0
 
     def has_startup_media_pending(self, session_key: str) -> bool:
         """Whether Telegram has media work that can still join a starting text turn."""

@@ -1,6 +1,7 @@
 import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -48,16 +49,6 @@ def _photo_event(source: SessionSource, path: str = "/tmp/alcohol-study.jpg") ->
         source=source,
         media_urls=[path],
         media_types=["image/jpeg"],
-    )
-
-
-def _voice_event(source: SessionSource, path: str = "/tmp/client-comment.ogg") -> MessageEvent:
-    return MessageEvent(
-        text="",
-        message_type=MessageType.VOICE,
-        source=source,
-        media_urls=[path],
-        media_types=["audio/ogg"],
     )
 
 
@@ -174,7 +165,7 @@ async def test_gateway_waits_for_in_progress_photo_download(monkeypatch):
     adapter = _make_adapter()
     runner = _make_runner(adapter)
     adapter._media_downloads_in_progress_by_session[session_key] = 1
-    monkeypatch.setenv("HERMES_TELEGRAM_STARTUP_MEDIA_GRACE_SECONDS", "0.2")
+    monkeypatch.setattr(runner, "_startup_media_grace_seconds", lambda: 0.2)
 
     async def finish_download():
         await asyncio.sleep(0.02)
@@ -199,29 +190,24 @@ async def test_gateway_waits_for_in_progress_photo_download(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_gateway_waits_for_late_voice_followup_without_download_marker(monkeypatch):
+async def test_gateway_text_only_fast_path_does_not_wait_without_pending_media(monkeypatch):
     source = _source()
     session_key = build_session_key(source)
     adapter = _make_adapter()
     runner = _make_runner(adapter)
-    monkeypatch.setenv("HERMES_TELEGRAM_STARTUP_MEDIA_GRACE_SECONDS", "0.2")
+    sleep = AsyncMock()
+    monkeypatch.setattr("gateway.run.asyncio.sleep", sleep)
 
-    async def enqueue_voice():
-        await asyncio.sleep(0.02)
-        adapter._pending_messages[session_key] = _voice_event(source)
-
-    producer = asyncio.create_task(enqueue_voice())
     event = await runner._merge_startup_media_followups(
         _text_event(source),
         source,
         session_key,
     )
-    await producer
 
-    assert event.message_type == MessageType.VOICE
+    assert event.message_type == MessageType.TEXT
     assert event.text == "Is this a real study?"
-    assert event.media_urls == ["/tmp/client-comment.ogg"]
-    assert session_key not in adapter._pending_messages
+    assert event.media_urls == []
+    sleep.assert_not_awaited()
 
 
 @pytest.mark.asyncio

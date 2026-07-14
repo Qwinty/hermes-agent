@@ -554,7 +554,7 @@ class TestMediaGroups:
 
     @pytest.mark.asyncio
     async def test_photo_album_flush_waits_for_in_progress_download(self, adapter, monkeypatch):
-        monkeypatch.setenv("HERMES_TELEGRAM_STARTUP_MEDIA_GRACE_SECONDS", "0.2")
+        monkeypatch.setattr(adapter, "_startup_media_grace_seconds", lambda: 0.2)
         adapter.MEDIA_GROUP_WAIT_SECONDS = 0.01
         if not hasattr(adapter, "_media_downloads_in_progress_by_session"):
             adapter._media_downloads_in_progress_by_session = {}

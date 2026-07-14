@@ -5739,14 +5739,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     @staticmethod
     def _startup_media_grace_seconds() -> float:
-        raw = os.getenv("HERMES_TELEGRAM_STARTUP_MEDIA_GRACE_SECONDS", "1.0")
-        try:
-            value = float(raw)
-        except (TypeError, ValueError):
-            value = 1.0
-        if not math.isfinite(value):
-            value = 1.0
-        return max(0.0, min(value, 3.0))
+        return 1.0
 
     @staticmethod
     def _format_forward_origin_context(forward_origin: Optional[Dict[str, str]]) -> Optional[str]:
@@ -5852,9 +5845,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     logger.debug("Telegram startup media pending check failed", exc_info=True)
                     has_pending = False
-            if merged_count and not has_pending:
-                break
-            if merged_text_batches and not has_pending:
+            if not has_pending:
                 break
             if loop.time() >= deadline:
                 break
@@ -6028,9 +6019,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 merge_text=True,
             )
             return True
-        if self._event_has_batch_media(event):
+        if (
+            event.source.platform == Platform.TELEGRAM
+            and running_agent is _AGENT_PENDING_SENTINEL
+            and self._event_has_batch_media(event)
+        ):
             logger.debug(
-                "Queueing busy media follow-up for session %s without interrupt/ack",
+                "Queueing Telegram startup media follow-up for session %s without interrupt/ack",
                 session_key,
             )
             merge_pending_message_event(
