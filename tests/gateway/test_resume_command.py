@@ -33,7 +33,7 @@ def _session_key_for_event(event):
 
 def _make_runner(session_db=None, current_session_id="current_session_001",
                  event=None):
-    """Create a bare GatewayRunner with a mock session_store and optional session_db."""
+    """Create a bare GatewayRunner with mocked sync/async session stores."""
     from gateway.run import GatewayRunner
     runner = object.__new__(GatewayRunner)
     runner.adapters = {}
@@ -50,15 +50,19 @@ def _make_runner(session_db=None, current_session_id="current_session_001",
     # Compute the real session key if an event is provided
     session_key = build_session_key(event.source) if event else "agent:main:telegram:dm"
 
-    # Mock session_store that returns a session entry with a known session_id
+    # Keep the synchronous store for origin lookups, but mock the async boundary
+    # that slash handlers await directly.
     mock_session_entry = MagicMock()
     mock_session_entry.session_id = current_session_id
     mock_session_entry.session_key = session_key
     mock_store = MagicMock()
-    mock_store.get_or_create_session.return_value = mock_session_entry
-    mock_store.load_transcript.return_value = []
-    mock_store.switch_session.return_value = mock_session_entry
     runner.session_store = mock_store
+    runner._async_session_store = SimpleNamespace(
+        _store=mock_store,
+        get_or_create_session=AsyncMock(return_value=mock_session_entry),
+        load_transcript=AsyncMock(return_value=[]),
+        switch_session=AsyncMock(return_value=mock_session_entry),
+    )
 
     return runner
 
@@ -131,9 +135,9 @@ class TestHandleResumeCommand:
         result = await runner._handle_resume_command(event)
 
         assert "Resumed" in result
-        runner.session_store.switch_session.assert_called_once()
-        call_args = runner.session_store.switch_session.call_args
-        assert call_args[0][1] == "sess_001"
+        runner.async_session_store.switch_session.assert_awaited_once_with(
+            _session_key_for_event(event), "sess_001"
+        )
         db.close()
 
     @pytest.mark.asyncio
@@ -152,7 +156,7 @@ class TestHandleResumeCommand:
 
         assert "out of range" in result.lower()
         assert "/resume" in result
-        runner.session_store.switch_session.assert_not_called()
+        runner.async_session_store.switch_session.assert_not_awaited()
         db.close()
 
     @pytest.mark.asyncio
@@ -171,10 +175,9 @@ class TestHandleResumeCommand:
 
         assert "Resumed" in result
         assert "My Project" in result
-        # Verify switch_session was called with the old session ID
-        runner.session_store.switch_session.assert_called_once()
-        call_args = runner.session_store.switch_session.call_args
-        assert call_args[0][1] == "old_session_abc"
+        runner.async_session_store.switch_session.assert_awaited_once_with(
+            _session_key_for_event(event), "old_session_abc"
+        )
         db.close()
 
     @pytest.mark.asyncio
@@ -199,9 +202,15 @@ class TestHandleResumeCommand:
 
         assert "Resumed" in result
         assert "Topic A Work" in result
-        runner.session_store.switch_session.assert_called_once()
-        call_args = runner.session_store.switch_session.call_args
-        assert call_args[0][1] == "topic_a_session"
+        runner.async_session_store.get_or_create_session.assert_awaited_once_with(
+            event.source
+        )
+        runner.async_session_store.switch_session.assert_awaited_once_with(
+            _session_key_for_event(event), "topic_a_session"
+        )
+        runner.async_session_store.load_transcript.assert_awaited_once_with(
+            "topic_a_session"
+        )
         db.close()
 
     @pytest.mark.asyncio
@@ -313,8 +322,9 @@ class TestHandleResumeCommand:
 
         assert "Resumed" in result
         # Should resolve to #2 (latest in lineage)
-        call_args = runner.session_store.switch_session.call_args
-        assert call_args[0][1] == "sess_v2"
+        runner.async_session_store.switch_session.assert_awaited_once_with(
+            _session_key_for_event(event), "sess_v2"
+        )
         db.close()
 
     @pytest.mark.asyncio
@@ -336,7 +346,7 @@ class TestHandleResumeCommand:
             current_session_id="current_session_001",
             event=event,
         )
-        runner.session_store.load_transcript.side_effect = (
+        runner.async_session_store.load_transcript.side_effect = (
             lambda session_id: [{"role": "user", "content": "hello from continuation"}]
             if session_id == "compressed_child"
             else []
@@ -346,9 +356,12 @@ class TestHandleResumeCommand:
 
         assert "Resumed session" in result
         assert "(1 message)" in result
-        call_args = runner.session_store.switch_session.call_args
-        assert call_args[0][1] == "compressed_child"
-        runner.session_store.load_transcript.assert_called_with("compressed_child")
+        runner.async_session_store.switch_session.assert_awaited_once_with(
+            _session_key_for_event(event), "compressed_child"
+        )
+        runner.async_session_store.load_transcript.assert_awaited_once_with(
+            "compressed_child"
+        )
         db.close()
 
     @pytest.mark.asyncio
@@ -579,7 +592,7 @@ class TestHandleSessionsCommand:
             runner = _make_runner(session_db=db, current_session_id="current_session_001",
                                   event=event)
             result = await runner._handle_resume_command(event)
-            runner.session_store.switch_session.assert_not_called()
+            runner.async_session_store.switch_session.assert_not_awaited()
             assert "Resumed" not in result, name
         db.close()
 
@@ -606,7 +619,7 @@ class TestHandleSessionsCommand:
             runner = _make_runner(session_db=db, current_session_id="current_session_001",
                                   event=event)
             result = await runner._handle_resume_command(event)
-            runner.session_store.switch_session.assert_not_called()
+            runner.async_session_store.switch_session.assert_not_awaited()
             assert "Resumed" not in result, name
         db.close()
 
@@ -629,7 +642,7 @@ class TestHandleSessionsCommand:
             runner = _make_runner(session_db=db, current_session_id="current_session_001",
                                   event=event)
             result = await runner._handle_resume_command(event)
-            runner.session_store.switch_session.assert_not_called()
+            runner.async_session_store.switch_session.assert_not_awaited()
             assert "Resumed" not in result, name
         db.close()
 
@@ -669,7 +682,7 @@ class TestHandleSessionsCommand:
             runner = _make_runner(session_db=db, current_session_id="current_session_001",
                                   event=event)
             result = await runner._handle_resume_command(event)
-            runner.session_store.switch_session.assert_not_called()
+            runner.async_session_store.switch_session.assert_not_awaited()
             assert "Resumed" not in result, name
         db.close()
 
