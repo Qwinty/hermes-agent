@@ -1429,6 +1429,7 @@ def restore_primary_runtime(agent) -> bool:
                 pool_matches_primary = False
         if pool is not None and pool_provider and not pool_matches_primary:
             agent._credential_pool = None
+            agent._credential_pool_entry_id = None
             try:
                 from agent.credential_pool import load_pool
 
@@ -2098,6 +2099,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             # A pool bound to the old provider is worse than no pool: the
             # recovery guard rejects it and every later 401/429 skips rotation.
             agent._credential_pool = None
+            agent._credential_pool_entry_id = None
             try:
                 from agent.credential_pool import load_pool
                 agent._credential_pool = load_pool(new_provider)

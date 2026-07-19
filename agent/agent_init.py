@@ -494,8 +494,10 @@ def init_agent(
                 base_url=agent.base_url,
             ):
                 agent._credential_pool = None
+                agent._credential_pool_entry_id = None
         except Exception:
             agent._credential_pool = None
+            agent._credential_pool_entry_id = None
 
     # Eagerly warm the transport cache so import errors surface at init,
     # not mid-conversation.  Also validates the api_mode is registered.
