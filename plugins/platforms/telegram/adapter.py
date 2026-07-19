@@ -8420,6 +8420,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     return True
             except Exception:
                 continue
+        text_event = (getattr(self, "_pending_text_batches", {}) or {}).get(session_key)
+        text = (getattr(text_event, "text", None) or "").lstrip()
+        if text.startswith("[Forwarded message |"):
+            return True
         return False
 
     @staticmethod
@@ -8463,6 +8467,23 @@ class TelegramAdapter(BasePlatformAdapter):
                 task.cancel()
             if event is not None and self._event_has_startup_attachment(event):
                 merge_pending_message_event(merged_by_session, session_key, event)
+
+        pending_text_batches = getattr(self, "_pending_text_batches", None) or {}
+        text_event = pending_text_batches.get(session_key)
+        text = (getattr(text_event, "text", None) or "").lstrip()
+        if text.startswith("[Forwarded message |"):
+            text_event = pending_text_batches.pop(session_key, None)
+            text_tasks = getattr(self, "_pending_text_batch_tasks", None) or {}
+            task = text_tasks.pop(session_key, None)
+            if task is not None and not task.done():
+                task.cancel()
+            if text_event is not None:
+                merge_pending_message_event(
+                    merged_by_session,
+                    session_key,
+                    text_event,
+                    merge_text=True,
+                )
 
         return merged_by_session.get(session_key)
 
@@ -8644,6 +8665,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._track_media_download_done(audio_download_session_key)
 
         elif msg.video:
+            video_download_session_key = self._track_media_download_start(event)
             try:
                 allowed, note = self._telegram_media_size_allowed(msg.video, "video file")
                 if not allowed:
@@ -8666,6 +8688,8 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning("[Telegram] Failed to cache video: %s", _redact_telegram_error_text(e), exc_info=True)
                 await self._surface_media_cache_failure(msg, event, "video file", e)
+            finally:
+                self._track_media_download_done(video_download_session_key)
 
         # Download document files to cache for agent processing
         elif msg.document:
@@ -8749,14 +8773,18 @@ class TelegramAdapter(BasePlatformAdapter):
                     ext = image_mime_to_ext.get(doc.mime_type, "")
 
                 if ext in SUPPORTED_VIDEO_TYPES:
-                    file_obj = await doc.get_file()
-                    video_bytes = await file_obj.download_as_bytearray()
-                    cached_path = cache_video_from_bytes(bytes(video_bytes), ext=ext)
-                    event.media_urls = [cached_path]
-                    event.media_types = [SUPPORTED_VIDEO_TYPES[ext]]
-                    event.message_type = MessageType.VIDEO
-                    logger.info("[Telegram] Cached user video document at %s", cached_path)
-                    await self.handle_message(event)
+                    video_download_session_key = self._track_media_download_start(event)
+                    try:
+                        file_obj = await doc.get_file()
+                        video_bytes = await file_obj.download_as_bytearray()
+                        cached_path = cache_video_from_bytes(bytes(video_bytes), ext=ext)
+                        event.media_urls = [cached_path]
+                        event.media_types = [SUPPORTED_VIDEO_TYPES[ext]]
+                        event.message_type = MessageType.VIDEO
+                        logger.info("[Telegram] Cached user video document at %s", cached_path)
+                        await self.handle_message(event)
+                    finally:
+                        self._track_media_download_done(video_download_session_key)
                     return
 
                 # NOTE: image-document handling is performed earlier in this
