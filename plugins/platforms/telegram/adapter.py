@@ -8378,6 +8378,15 @@ class TelegramAdapter(BasePlatformAdapter):
             source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            profile=getattr(source, "profile", None),
+        )
+
+    @staticmethod
+    def _is_inline_forwarded_text(text: Optional[str]) -> bool:
+        """Recognize both populated and metadata-empty forward headers."""
+        first_line = (text or "").lstrip().splitlines()[0] if (text or "").strip() else ""
+        return first_line == "[Forwarded message]" or first_line.startswith(
+            "[Forwarded message |"
         )
 
     def _track_media_download_start(self, event: MessageEvent) -> str:
@@ -8426,8 +8435,7 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception:
                 continue
         text_event = (getattr(self, "_pending_text_batches", {}) or {}).get(session_key)
-        text = (getattr(text_event, "text", None) or "").lstrip()
-        if text.startswith("[Forwarded message |"):
+        if self._is_inline_forwarded_text(getattr(text_event, "text", None)):
             return True
         return False
 
@@ -8436,7 +8444,7 @@ class TelegramAdapter(BasePlatformAdapter):
         return bool(getattr(event, "media_urls", None))
 
     def pop_startup_media_event(self, session_key: str) -> Optional[MessageEvent]:
-        """Consume buffered Telegram attachment batches that can join a text turn."""
+        """Consume buffered Telegram media/forwarded batches joining a text turn."""
         if not session_key:
             return None
 
@@ -8475,8 +8483,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         pending_text_batches = getattr(self, "_pending_text_batches", None) or {}
         text_event = pending_text_batches.get(session_key)
-        text = (getattr(text_event, "text", None) or "").lstrip()
-        if text.startswith("[Forwarded message |"):
+        if self._is_inline_forwarded_text(getattr(text_event, "text", None)):
             text_event = pending_text_batches.pop(session_key, None)
             text_tasks = getattr(self, "_pending_text_batch_tasks", None) or {}
             task = text_tasks.pop(session_key, None)
@@ -8590,6 +8597,10 @@ class TelegramAdapter(BasePlatformAdapter):
         # Apply observe attribution after caption is set; sticker is handled above
         # because _handle_sticker overwrites event.text with its vision description.
         event = self._apply_telegram_group_observe_attribution(event)
+        # Media download counters must use the same recovered Telegram DM-topic
+        # lane as text batching and the gateway session key. The recovery hook is
+        # synchronous and may read session storage, so keep it off the event loop.
+        await asyncio.to_thread(self._apply_topic_recovery, event)
 
         # Download photo to local image cache so the vision tool can access it
         # even after Telegram's ephemeral file URLs expire (~1 hour).
