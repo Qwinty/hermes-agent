@@ -1156,7 +1156,11 @@ def _resolve_named_custom_runtime(
 
     provider_key = str(custom_provider.get("provider_key", "") or "").strip().lower()
     runtime_provider = "custom"
-    if provider_key:
+    # Only explicitly plugin-backed custom profiles should alter runtime
+    # provider semantics. A custom entry may reuse a built-in slug (for
+    # example ``minimax-cn``) while still being an ordinary custom endpoint.
+    _PLUGIN_BACKED_CUSTOM_PROVIDERS = {"cliproxyapi"}
+    if provider_key in _PLUGIN_BACKED_CUSTOM_PROVIDERS:
         try:
             import importlib
 
