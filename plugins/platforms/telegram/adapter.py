@@ -688,7 +688,7 @@ class TelegramAdapter(BasePlatformAdapter):
             | telegram_filters.Document.ALL
             | telegram_filters.Sticker.ALL
         )
-        video_note_filter = getattr(telegram_filters, "VIDEO_NOTE", None)
+        video_note_filter = vars(telegram_filters).get("VIDEO_NOTE")
         if video_note_filter is not None:
             media_filter = media_filter | video_note_filter
         return media_filter
@@ -9239,7 +9239,8 @@ class TelegramAdapter(BasePlatformAdapter):
             return MessageType.STICKER
         if msg.photo:
             return MessageType.PHOTO
-        if getattr(msg, "video_note", None):
+        video_note = getattr(msg, "video_note", None)
+        if video_note is not None and type(video_note).__module__.startswith("telegram"):
             return MessageType.VIDEO_NOTE
         if msg.video:
             return MessageType.VIDEO
@@ -10306,7 +10307,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.warning("[Telegram] Failed to cache audio: %s", _redact_telegram_error_text(e), exc_info=True)
                 await self._surface_media_cache_failure(msg, event, "audio file", e)
 
-        elif getattr(msg, "video_note", None):
+        elif (
+            (video_note := getattr(msg, "video_note", None)) is not None
+            and type(video_note).__module__.startswith("telegram")
+        ):
             try:
                 allowed, note = self._telegram_media_size_allowed(msg.video_note, "video note")
                 if not allowed:
