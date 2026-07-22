@@ -643,6 +643,25 @@ class TelegramAdapter(BasePlatformAdapter):
     - Media messages
     """
 
+    @staticmethod
+    def _media_message_filter():
+        """Return the Telegram filter for all supported inbound media."""
+        telegram_filters = filters
+        if telegram_filters is None:
+            raise RuntimeError("python-telegram-bot filters are unavailable")
+        media_filter = (
+            telegram_filters.PHOTO
+            | telegram_filters.VIDEO
+            | telegram_filters.AUDIO
+            | telegram_filters.VOICE
+            | telegram_filters.Document.ALL
+            | telegram_filters.Sticker.ALL
+        )
+        video_note_filter = getattr(telegram_filters, "VIDEO_NOTE", None)
+        if video_note_filter is not None:
+            media_filter = media_filter | video_note_filter
+        return media_filter
+
     # Telegram message limits
     MAX_MESSAGE_LENGTH = 4096
     supports_code_blocks = True  # Telegram MarkdownV2 renders fenced code blocks
@@ -3958,7 +3977,7 @@ class TelegramAdapter(BasePlatformAdapter):
             self._handle_location_message
         ))
         app.add_handler(TelegramMessageHandler(
-            filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
+            self._media_message_filter(filters),
             self._handle_media_message
         ))
         # Handle inline keyboard button callbacks (update prompts)
@@ -8815,6 +8834,8 @@ class TelegramAdapter(BasePlatformAdapter):
             return MessageType.STICKER
         if msg.photo:
             return MessageType.PHOTO
+        if getattr(msg, "video_note", None):
+            return MessageType.VIDEO_NOTE
         if msg.video:
             return MessageType.VIDEO
         if msg.audio:
@@ -9559,6 +9580,31 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning("[Telegram] Failed to cache audio: %s", _redact_telegram_error_text(e), exc_info=True)
                 await self._surface_media_cache_failure(msg, event, "audio file", e)
+
+        elif getattr(msg, "video_note", None):
+            try:
+                allowed, note = self._telegram_media_size_allowed(msg.video_note, "video note")
+                if not allowed:
+                    event.text = self._append_observed_note(event.text, note or "")
+                    logger.info(
+                        "[Telegram] Skipped oversized user video note (size=%s)",
+                        getattr(msg.video_note, "file_size", None),
+                    )
+                    await self.handle_message(event)
+                    return
+                file_obj = await msg.video_note.get_file()
+                video_bytes = await file_obj.download_as_bytearray()
+                cached_path = cache_video_from_bytes(bytes(video_bytes), ext=".mp4")
+                event.media_urls = [cached_path]
+                event.media_types = ["video/mp4"]
+                logger.info("[Telegram] Cached user video note at %s", cached_path)
+            except Exception as e:
+                logger.warning(
+                    "[Telegram] Failed to cache video note: %s",
+                    _redact_telegram_error_text(e),
+                    exc_info=True,
+                )
+                await self._surface_media_cache_failure(msg, event, "video note", e)
 
         elif msg.video:
             try:

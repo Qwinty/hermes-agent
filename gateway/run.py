@@ -2796,7 +2796,7 @@ def _event_media_is_stt_input(event, index: int) -> bool:
     if message_type in {MessageType.AUDIO, MessageType.DOCUMENT}:
         return False
     return (
-        message_type == MessageType.VOICE
+        message_type in {MessageType.VOICE, MessageType.VIDEO_NOTE}
         or _event_media_type_at(event, index).startswith("audio/")
     )
 
