@@ -2062,6 +2062,10 @@ class HindsightMemoryProvider(MemoryProvider):
             return True
         return False
 
+    def _recall_text_is_noise(self, text: str) -> bool:
+        """Return whether recall text matches configured memory-noise patterns."""
+        return bool(_matches_any_pattern(text or "", self._recall_skip_patterns))
+
     def _do_recall(self, query: str) -> _RecallResult:
         """Run one recall/reflect for *query*.
 
@@ -2071,6 +2075,9 @@ class HindsightMemoryProvider(MemoryProvider):
         text. Shared by the background prefetch worker (``queue_prefetch``) and
         the opt-in synchronous path (``prefetch`` when ``recall_sync`` is on).
         """
+        if self._recall_text_is_noise(query):
+            logger.debug("Recall: skipped noisy query")
+            return _RecallResult("", 0)
         # Truncate query to max chars
         if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
             query = query[:self._recall_max_input_chars]
@@ -2092,10 +2099,13 @@ class HindsightMemoryProvider(MemoryProvider):
             logger.debug("Recall: calling recall (bank=%s, query_len=%d, budget=%s)",
                          self._bank_id, len(query), self._budget)
             resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
-            num_results = len(resp.results) if resp.results else 0
-            logger.debug("Recall: returned %d results", num_results)
-            text = "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
-            return _RecallResult(text, num_results)
+            filtered_results = [
+                r for r in (resp.results or [])
+                if r.text and not self._recall_text_is_noise(r.text)
+            ]
+            logger.debug("Recall: returned %d filtered results", len(filtered_results))
+            text = "\n".join(f"- {r.text}" for r in filtered_results)
+            return _RecallResult(text, len(filtered_results))
         except Exception as e:
             logger.debug("Hindsight recall failed: %s", e, exc_info=True)
             return _RecallResult("", 0)

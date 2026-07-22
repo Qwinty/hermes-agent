@@ -2447,7 +2447,7 @@ def _transcribe_deepgram(file_path: str, model_name: str) -> Dict[str, Any]:
         return {"success": False, "transcript": "", "error": "DEEPGRAM_API_KEY not set"}
 
     stt_config = _load_stt_config()
-    deepgram_cfg = stt_config.get("deepgram", {})
+    deepgram_cfg = stt_config.get("deepgram") or {}
     base_url = str(
         deepgram_cfg.get("base_url")
         or get_env_value("DEEPGRAM_STT_BASE_URL")

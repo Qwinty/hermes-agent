@@ -2224,7 +2224,7 @@ def _generate_deepgram_tts(text: str, output_path: str, tts_config: Dict[str, An
     if not api_key:
         raise ValueError("DEEPGRAM_API_KEY not set. Get one at https://console.deepgram.com/")
 
-    dg_config = tts_config.get("deepgram", {})
+    dg_config = tts_config.get("deepgram") or {}
     model = str(dg_config.get("model", DEFAULT_DEEPGRAM_TTS_MODEL)).strip() or DEFAULT_DEEPGRAM_TTS_MODEL
     base_url = str(
         dg_config.get("base_url")

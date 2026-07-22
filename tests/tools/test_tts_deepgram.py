@@ -39,6 +39,22 @@ def test_generate_deepgram_tts_writes_mp3(tmp_path, monkeypatch):
     assert "encoding" not in captured["params"]
 
 
+def test_generate_deepgram_tts_accepts_null_provider_config(tmp_path, monkeypatch):
+    from tools import tts_tool
+
+    monkeypatch.setenv("DEEPGRAM_API_KEY", "dg-test")
+    response = MagicMock(status_code=200, content=b"audio")
+
+    with patch("requests.post", return_value=response):
+        result = tts_tool._generate_deepgram_tts(
+            "Hello",
+            str(tmp_path / "out.mp3"),
+            {"deepgram": None},
+        )
+
+    assert result.endswith("out.mp3")
+
+
 def test_generate_deepgram_tts_requests_ogg_opus(tmp_path, monkeypatch):
     from tools import tts_tool
 

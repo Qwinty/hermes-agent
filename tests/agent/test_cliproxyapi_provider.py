@@ -167,9 +167,11 @@ def test_cliproxyapi_kimi_k27_code_maps_xhigh_to_high():
     assert _kwargs_for("kimi-k2.7-code", "max")["reasoning_effort"] == "high"
 
 
-def test_cliproxyapi_deepseek_v4_preserves_full_effort_ladder():
-    for effort in ("low", "medium", "high", "xhigh", "max"):
+def test_cliproxyapi_deepseek_v4_clamps_to_deployed_effort_ladder():
+    for effort in ("low", "medium", "high"):
         assert _kwargs_for("deepseek-v4-pro", effort)["reasoning_effort"] == effort
+    for effort in ("xhigh", "max"):
+        assert _kwargs_for("deepseek-v4-pro", effort)["reasoning_effort"] == "high"
 
 
 def test_cliproxyapi_qwen37_max_supports_none_and_max():

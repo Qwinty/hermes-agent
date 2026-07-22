@@ -218,7 +218,10 @@ def _clamp_opencode_go_effort(model: str | None, effort: str) -> str | None:
         return effort if effort in _OPENCODE_GO_KIMI_K2_EFFORTS else None
 
     if _is_deepseek_v4_model(model):
-        return effort if effort in _OPENCODE_GO_FULL_EFFORTS else None
+        # The deployed CPA catalog advertises low/medium/high for DeepSeek V4.
+        # Clamp Hermes' upper aliases rather than forwarding unsupported dials.
+        effort = {"xhigh": "high", "max": "high"}.get(effort, effort)
+        return effort if effort in {"low", "medium", "high"} else None
 
     if _is_qwen37_max_model(model):
         return effort if effort in _OPENCODE_GO_QWEN_EFFORTS else None
