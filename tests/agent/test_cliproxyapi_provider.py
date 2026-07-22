@@ -140,3 +140,39 @@ def test_cliproxyapi_composer_grok_keeps_cache_key_without_effort_dial():
     assert "reasoning_effort" not in kwargs
     assert kwargs["extra_body"]["prompt_cache_key"] == "test-session"
     assert kwargs["extra_headers"]["x-grok-conv-id"] == "test-session"
+
+
+def test_cliproxyapi_kimi_k3_clamps_any_effort_to_max():
+    for effort in ("low", "medium", "high", "xhigh", "max"):
+        kwargs = _kwargs_for("kimi-k3", effort)
+        assert kwargs["reasoning_effort"] == "max", effort
+
+
+def test_cliproxyapi_kimi_k3_reasoning_none_omits_effort():
+    # K3 always thinks; CPA/Moonshot have no off dial. Omit rather than invent none.
+    kwargs = _kwargs_for("kimi-k3", "none")
+    assert "reasoning_effort" not in kwargs
+
+
+def test_cliproxyapi_glm52_maps_to_high_and_max():
+    assert _kwargs_for("glm-5.2", "low")["reasoning_effort"] == "high"
+    assert _kwargs_for("glm-5.2", "high")["reasoning_effort"] == "high"
+    assert _kwargs_for("glm-5.2", "xhigh")["reasoning_effort"] == "max"
+    assert _kwargs_for("glm-5.2-max", "medium")["reasoning_effort"] == "max"
+
+
+def test_cliproxyapi_kimi_k27_code_maps_xhigh_to_high():
+    assert _kwargs_for("kimi-k2.7-code", "medium")["reasoning_effort"] == "medium"
+    assert _kwargs_for("kimi-k2.7-code", "xhigh")["reasoning_effort"] == "high"
+    assert _kwargs_for("kimi-k2.7-code", "max")["reasoning_effort"] == "high"
+
+
+def test_cliproxyapi_deepseek_v4_preserves_full_effort_ladder():
+    for effort in ("low", "medium", "high", "xhigh", "max"):
+        assert _kwargs_for("deepseek-v4-pro", effort)["reasoning_effort"] == effort
+
+
+def test_cliproxyapi_qwen37_max_supports_none_and_max():
+    assert _kwargs_for("qwen3.7-max", "none")["reasoning_effort"] == "none"
+    assert _kwargs_for("qwen3.7-max", "max")["reasoning_effort"] == "max"
+    assert _kwargs_for("oc/qwen3.7-max", "high")["reasoning_effort"] == "high"
