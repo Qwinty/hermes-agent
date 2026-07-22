@@ -26184,6 +26184,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         enabled_toolsets = self._resolve_enabled_toolsets_for_source(
             user_config, source, platform_key
         )
+        if guest_mode_invocation:
+            telegram_cfg = user_config.get("telegram") or {}
+            raw_guest_toolsets = (
+                telegram_cfg.get("guest_mode_toolsets")
+                or telegram_cfg.get("guest_tools")
+                or user_config.get("platform_toolsets", {}).get("telegram_guest")
+                or []
+            ) if isinstance(telegram_cfg, dict) else []
+            if isinstance(raw_guest_toolsets, str):
+                raw_guest_toolsets = [
+                    item.strip() for item in raw_guest_toolsets.split(",") if item.strip()
+                ]
+            enabled_toolsets = sorted(str(item) for item in raw_guest_toolsets)
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
 
