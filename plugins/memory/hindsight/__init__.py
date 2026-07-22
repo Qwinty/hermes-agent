@@ -909,6 +909,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
         # Tags
         self._tags: list[str] | None = None
+        self._observation_scopes = None
         self._recall_tags: list[str] | None = None
         self._recall_tags_match = "any"
 
