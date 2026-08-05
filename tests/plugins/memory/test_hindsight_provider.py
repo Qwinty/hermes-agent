@@ -430,6 +430,7 @@ class TestPostSetup:
             "HINDSIGHT_API_LLM_API_KEY=sk-local-test\n"
             "HINDSIGHT_API_LLM_MODEL=gpt-4o-mini\n"
             "HINDSIGHT_API_LOG_LEVEL=info\n"
+            "HINDSIGHT_API_LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai\n"
             "HINDSIGHT_EMBED_DAEMON_IDLE_TIMEOUT=300\n"
         )
 
