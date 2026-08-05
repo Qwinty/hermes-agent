@@ -4929,6 +4929,7 @@ class TurnRunner:
                 source=ctx.source,
                 session_key=ctx.session_key,
                 user_config=ctx.user_config,
+                guest_mode_invocation=ctx.guest_mode_invocation,
             )
             logger.debug(
                 "run_agent resolved: model=%s provider=%s session=%s",
@@ -4947,6 +4948,8 @@ class TurnRunner:
             source=ctx.source,
             session_key=ctx.session_key,
             model=model,
+            user_config=ctx.user_config,
+            guest_mode_invocation=ctx.guest_mode_invocation,
         )
         self._runner._reasoning_config = reasoning_config
         self._runner._service_tier = self._runner._resolve_session_service_tier(
@@ -7378,12 +7381,132 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return source
         return dataclasses.replace(source, thread_id=recovered)
 
+    def _parse_telegram_guest_mode_model_config(
+        self,
+        user_config: Optional[dict],
+    ) -> Optional[dict]:
+        """Return normalized telegram.guest_mode_model config, if present."""
+        telegram_cfg = (user_config or {}).get("telegram") or {}
+        if not isinstance(telegram_cfg, dict):
+            return None
+        raw = telegram_cfg.get("guest_mode_model") or telegram_cfg.get("guest_model")
+        if raw in (None, "", {}):
+            return None
+
+        if isinstance(raw, dict):
+            provider = str(raw.get("provider") or raw.get("provider_slug") or "").strip()
+            model = str(raw.get("model") or raw.get("default") or raw.get("name") or "").strip()
+            base_url = str(raw.get("base_url") or raw.get("api") or raw.get("url") or "").strip()
+            api_key = str(raw.get("api_key") or "").strip()
+            api_mode = str(raw.get("api_mode") or raw.get("transport") or "").strip()
+            if not (provider or model or base_url):
+                return None
+            return {
+                "provider": provider,
+                "model": model,
+                "base_url": base_url,
+                "api_key": api_key,
+                "api_mode": api_mode,
+            }
+
+        if isinstance(raw, str):
+            value = raw.strip()
+            if not value:
+                return None
+            provider = ""
+            model = value
+            # Compact form for named custom providers:
+            #   custom:CommandCode/deepseek-v4-pro
+            if value.lower().startswith("custom:") and "/" in value:
+                provider, model = value.rsplit("/", 1)
+            return {
+                "provider": provider.strip(),
+                "model": model.strip(),
+                "base_url": "",
+                "api_key": "",
+                "api_mode": "",
+            }
+
+        return None
+
+    def _parse_telegram_guest_mode_reasoning_config(
+        self,
+        user_config: Optional[dict],
+    ) -> Optional[dict]:
+        """Return telegram guest-mode reasoning config, if present."""
+        from hermes_constants import parse_reasoning_effort
+
+        telegram_cfg = (user_config or {}).get("telegram") or {}
+        if not isinstance(telegram_cfg, dict):
+            return None
+
+        raw = (
+            telegram_cfg.get("guest_mode_reasoning_effort")
+            or telegram_cfg.get("guest_reasoning_effort")
+            or telegram_cfg.get("guest_reasoning")
+        )
+        guest_model = telegram_cfg.get("guest_mode_model") or telegram_cfg.get("guest_model")
+        if raw in (None, "") and isinstance(guest_model, dict):
+            raw = guest_model.get("reasoning_effort") or guest_model.get("reasoning")
+        if raw in (None, ""):
+            return None
+
+        effort = str(raw).strip()
+        result = parse_reasoning_effort(effort)
+        if effort and result is None:
+            logger.warning("Unknown telegram guest-mode reasoning_effort '%s', using default", effort)
+        return result
+
+    def _apply_telegram_guest_mode_model_override(
+        self,
+        *,
+        user_config: Optional[dict],
+        model: str,
+        runtime_kwargs: dict,
+    ) -> tuple[str, dict]:
+        """Apply telegram.guest_mode_model to guest-mode Telegram invocations."""
+        guest_cfg = self._parse_telegram_guest_mode_model_config(user_config)
+        if not guest_cfg:
+            return model, runtime_kwargs
+
+        guest_model = guest_cfg.get("model") or model
+        guest_provider = guest_cfg.get("provider") or runtime_kwargs.get("provider") or ""
+        try:
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+            runtime = resolve_runtime_provider(
+                requested=guest_provider or None,
+                explicit_base_url=guest_cfg.get("base_url") or None,
+                explicit_api_key=guest_cfg.get("api_key") or None,
+                target_model=guest_model,
+            )
+            resolved_runtime = {
+                "api_key": runtime.get("api_key"),
+                "base_url": runtime.get("base_url"),
+                "provider": runtime.get("provider"),
+                "api_mode": guest_cfg.get("api_mode") or runtime.get("api_mode"),
+                "command": runtime.get("command"),
+                "args": list(runtime.get("args") or []),
+                "credential_pool": runtime.get("credential_pool"),
+            }
+            resolved_model = guest_model or runtime.get("model") or model
+            logger.info(
+                "Telegram guest-mode model override: %s/%s -> %s/%s",
+                runtime_kwargs.get("provider"), model,
+                resolved_runtime.get("provider"), resolved_model,
+            )
+            return resolved_model, resolved_runtime
+        except Exception as exc:
+            logger.warning("Failed to apply telegram.guest_mode_model override: %s", exc)
+            return model, runtime_kwargs
+
     def _resolve_session_agent_runtime(
         self,
         *,
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
         user_config: Optional[dict] = None,
+        guest_mode_invocation: bool = False,
     ) -> tuple[str, dict]:
         """Resolve model/runtime for a session.
 
@@ -7491,6 +7614,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if override and resolved_session_key:
             model, runtime_kwargs = self._apply_session_model_override(
                 resolved_session_key, model, runtime_kwargs
+            )
+
+        if guest_mode_invocation and not override:
+            model, runtime_kwargs = self._apply_telegram_guest_mode_model_override(
+                user_config=user_config,
+                model=model,
+                runtime_kwargs=runtime_kwargs,
             )
 
         # When the config has no model.default but a provider was resolved
@@ -8785,6 +8915,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
         model: str = "",
+        user_config: Optional[dict] = None,
+        guest_mode_invocation: bool = False,
     ) -> dict | None:
         """Resolve reasoning effort for a session, honoring session overrides.
 
@@ -8806,6 +8938,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _r_state = self._peek_session_state(resolved_session_key)
             if _r_state is not None and _r_state.conversation.reasoning_override is not None:
                 return _r_state.conversation.reasoning_override
+        if guest_mode_invocation:
+            guest_reasoning = self._parse_telegram_guest_mode_reasoning_config(user_config)
+            if guest_reasoning is not None:
+                return guest_reasoning
         return self._load_reasoning_config(model)
 
     def _set_session_reasoning_override(
@@ -19168,6 +19304,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=event.message_type,
+                guest_mode_invocation=guest_mode_invocation,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -26149,6 +26286,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        guest_mode_invocation: bool = False,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -26168,6 +26306,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                guest_mode_invocation=guest_mode_invocation,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -26180,6 +26319,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                guest_mode_invocation=guest_mode_invocation,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -26322,6 +26462,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        guest_mode_invocation: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -26639,6 +26780,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _interrupt_depth=_interrupt_depth,
             event_message_id=event_message_id,
             moa_config=moa_config,
+            guest_mode_invocation=guest_mode_invocation,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
         )
@@ -27871,6 +28013,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
+                    guest_mode_invocation=guest_mode_invocation,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
