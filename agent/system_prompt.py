@@ -36,12 +36,7 @@ from agent.prompt_builder import (
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
     KANBAN_GUIDANCE,
-    MEMORY_GUIDANCE,
-    OPENAI_MODEL_EXECUTION_GUIDANCE,
-    PARALLEL_TOOL_CALL_GUIDANCE,
     PLATFORM_HINTS,
-    SESSION_SEARCH_GUIDANCE,
-    SKILLS_GUIDANCE,
     STEER_CHANNEL_NOTE,
     TASK_COMPLETION_GUIDANCE,
     TELEGRAM_RICH_MESSAGES_HINT,
@@ -325,25 +320,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if getattr(agent, "_task_completion_guidance", True) and agent.valid_tool_names:
         stable_parts.append(TASK_COMPLETION_GUIDANCE)
 
-    # Universal parallel-tool-call guidance.  Tells the model to batch
-    # independent tool calls into one assistant turn rather than emitting one
-    # call per turn — the runtime already runs independent calls concurrently
-    # (read-only tools always; non-overlapping path-scoped file ops), so the
-    # only thing missing was steering the model to produce the batch.  Cuts
-    # round-trips and the resent-context cost that compounds over a long
-    # conversation.  Gated by config.yaml ``agent.parallel_tool_call_guidance``
-    # (default True) and only injected when tools are actually loaded.
-    if getattr(agent, "_parallel_tool_call_guidance", True) and agent.valid_tool_names:
-        stable_parts.append(PARALLEL_TOOL_CALL_GUIDANCE)
-
-    # Tool-aware behavioral guidance: only inject when the tools are loaded
+    # Tool-specific workflows belong in the tool schemas. Keep only the
+    # headless kanban lifecycle here because it coordinates several board tools
+    # and changes the whole execution mode.
     tool_guidance = []
-    if "memory" in agent.valid_tool_names:
-        tool_guidance.append(MEMORY_GUIDANCE)
-    if "session_search" in agent.valid_tool_names:
-        tool_guidance.append(SESSION_SEARCH_GUIDANCE)
-    if "skill_manage" in agent.valid_tool_names:
-        tool_guidance.append(SKILLS_GUIDANCE)
     # Kanban worker/orchestrator lifecycle — only present when the
     # dispatcher spawned this process (kanban_show check_fn gates on
     # HERMES_KANBAN_TASK env var). Normal chat sessions never see
@@ -361,14 +341,6 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # agent has tools. Static text → byte-stable prompt (no cache hit).
     if agent.valid_tool_names:
         stable_parts.append(STEER_CHANNEL_NOTE)
-
-    # Computer-use — goes in as its own block rather than being merged into
-    # tool_guidance because the content is multi-paragraph. The guidance is
-    # rendered for the host platform so Windows/Linux hosts don't see
-    # macOS-only wording (Mac, Space, cmd+s).
-    if "computer_use" in agent.valid_tool_names:
-        from agent.prompt_builder import computer_use_guidance
-        stable_parts.append(computer_use_guidance())
 
     nous_subscription_prompt = _r.build_nous_subscription_prompt(agent.valid_tool_names)
     if nous_subscription_prompt:
@@ -401,13 +373,6 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             # paths, parallel tool calls, verify-before-edit, etc.)
             if "gemini" in _model_lower or "gemma" in _model_lower:
                 stable_parts.append(GOOGLE_MODEL_OPERATIONAL_GUIDANCE)
-            # OpenAI GPT/Codex execution discipline (tool persistence,
-            # prerequisite checks, verification, anti-hallucination).
-            # Also applied to xAI Grok — same failure modes (claims completion
-            # without tool calls, suggests workarounds instead of using
-            # existing tools, replies with plans instead of executing).
-            if "gpt" in _model_lower or "codex" in _model_lower or "grok" in _model_lower:
-                stable_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
 
     has_skills_tools = any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
     if has_skills_tools:
