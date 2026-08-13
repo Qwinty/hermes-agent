@@ -870,8 +870,8 @@ class TestModelOptionsEndpoint:
             "provider": "cliproxyapi",
         }
 
-        with patch("gateway.platforms.api_server.load_picker_context") as load_ctx, patch(
-            "gateway.platforms.api_server.build_models_payload",
+        with patch("hermes_cli.inventory.load_picker_context") as load_ctx, patch(
+            "hermes_cli.inventory.build_model_options_payload",
             return_value=payload,
         ) as build_payload:
             load_ctx.return_value = MagicMock()
@@ -883,18 +883,15 @@ class TestModelOptionsEndpoint:
         assert data == payload
         build_payload.assert_called_once_with(
             load_ctx.return_value,
-            capabilities=True,
-            max_models=None,
-            probe_custom_providers=False,
-            probe_current_custom_provider=True,
+            include_unconfigured=True,
             refresh=False,
         )
 
     @pytest.mark.asyncio
     async def test_model_options_refresh_probes_all_custom_providers(self, adapter):
         app = _create_app(adapter)
-        with patch("gateway.platforms.api_server.load_picker_context") as load_ctx, patch(
-            "gateway.platforms.api_server.build_models_payload",
+        with patch("hermes_cli.inventory.load_picker_context") as load_ctx, patch(
+            "hermes_cli.inventory.build_model_options_payload",
             return_value={"providers": [], "model": "", "provider": ""},
         ) as build_payload:
             load_ctx.return_value = MagicMock()
@@ -904,10 +901,7 @@ class TestModelOptionsEndpoint:
 
         build_payload.assert_called_once_with(
             load_ctx.return_value,
-            capabilities=True,
-            max_models=None,
-            probe_custom_providers=True,
-            probe_current_custom_provider=True,
+            include_unconfigured=True,
             refresh=True,
         )
 
