@@ -1125,6 +1125,16 @@ class TelegramAdapter(BasePlatformAdapter):
         if not normalized_user_id:
             return False
 
+        scoped_auth: Optional[bool] = None
+        if getattr(self, "_authorization_check", None) is not None:
+            scoped_auth = self._is_sender_authorized(
+                normalized_user_id,
+                chat_type,
+                str(chat_id) if chat_id is not None else None,
+            )
+        if scoped_auth is not None:
+            return bool(scoped_auth)
+
         runner = getattr(self, "gateway_runner", None)
         if runner is None:
             runner = getattr(getattr(self, "_message_handler", None), "__self__", None)

@@ -299,6 +299,40 @@ async def test_callback_routes_through_runner_command_path(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_callback_prefers_profile_scoped_authorization_check(monkeypatch):
+    adapter = _make_adapter(monkeypatch)
+    runner = _CallbackRunner(authorized=True)
+    adapter.gateway_runner = runner
+
+    async def profile_scoped_handler(event):
+        return await runner._handle_message(event)
+
+    adapter.set_message_handler(profile_scoped_handler)
+    adapter._authorization_check = lambda _user_id, _chat_type, _chat_id: False
+    adapter.send = AsyncMock()
+    query = SimpleNamespace(
+        data="wa:m:a:abc12345",
+        from_user=SimpleNamespace(id=42, first_name="Joe"),
+        message=SimpleNamespace(
+            chat_id=12345,
+            chat=SimpleNamespace(type="private"),
+            message_thread_id=None,
+            message_id=77,
+        ),
+        answer=AsyncMock(),
+        edit_message_reply_markup=AsyncMock(),
+    )
+
+    await adapter._handle_callback_query(
+        SimpleNamespace(callback_query=query), SimpleNamespace()
+    )
+
+    assert runner.events == []
+    adapter.send.assert_not_awaited()
+    assert "not authorized" in query.answer.call_args.kwargs["text"].lower()
+
+
+@pytest.mark.asyncio
 async def test_callback_fails_closed_for_unauthorized_user(monkeypatch):
     adapter = _make_adapter(monkeypatch)
     runner = _CallbackRunner(authorized=False)
