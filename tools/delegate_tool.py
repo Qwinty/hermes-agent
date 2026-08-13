@@ -4475,7 +4475,7 @@ def _build_top_level_description() -> str:
         "- Leaf children (the default) cannot call delegate_task, clarify, "
         "memory, send_message, or cronjob; orchestrators regain only "
         "delegate_task.\n"
-        "- Children use the requested operator-defined route when provided; "
+        "Children use the requested operator-defined route when provided; "
         "otherwise delegation.default_route applies. The reserved 'inherit' "
         "route keeps the parent model and fallback chain. "
         "Results are returned as an array, one entry per task."

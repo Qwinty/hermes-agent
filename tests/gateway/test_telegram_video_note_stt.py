@@ -43,7 +43,7 @@ async def test_video_note_message_is_transcribed_from_mp4():
             history=[],
         )
 
-    mock_transcribe.assert_called_once_with("/tmp/video-note.mp4")
+    mock_transcribe.assert_called_once_with("/tmp/video-note.mp4", None, "gateway")
     assert "video note words" in result
 
 

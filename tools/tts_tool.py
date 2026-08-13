@@ -3661,7 +3661,7 @@ def text_to_speech_tool(
         if command_provider_config is not None:
             fmt = _get_command_tts_output_format(command_provider_config)
             base_path = out_dir / f"tts_{timestamp}.{fmt}"
-        elif want_opus and provider in {"openai", "elevenlabs", "mistral", "gemini"}:
+        elif want_opus and provider in {"openai", "elevenlabs", "mistral", "gemini", "deepgram"}:
             base_path = out_dir / f"tts_{timestamp}.ogg"
         else:
             base_path = out_dir / f"tts_{timestamp}.mp3"
