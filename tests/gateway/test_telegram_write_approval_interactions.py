@@ -260,7 +260,17 @@ async def test_callback_routes_through_runner_command_path(monkeypatch):
     adapter = _make_adapter(monkeypatch)
     runner = _CallbackRunner()
     adapter.gateway_runner = runner
-    adapter.set_message_handler(runner._handle_message)
+
+    async def profile_scoped_handler(event):
+        return await runner._handle_message(event)
+
+    adapter._authorization_check = (
+        lambda user_id, chat_type, chat_id: (
+            user_id == "42" and chat_type == "private" and chat_id == "12345"
+        )
+    )
+    adapter.set_message_handler(profile_scoped_handler)
+    assert not hasattr(profile_scoped_handler, "__self__")
     adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="78"))
     query = SimpleNamespace(
         data="wa:m:a:abc12345",
