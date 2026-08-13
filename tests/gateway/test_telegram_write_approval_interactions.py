@@ -247,6 +247,9 @@ class _CallbackRunner:
     def _is_user_authorized(self, _source):
         return self.authorized
 
+    def _profile_name_for_source(self, _source):
+        return "routed-profile"
+
     async def _handle_message(self, event):
         self.events.append(event)
         return WriteApprovalReply("Approved 1 memory write(s).", MEMORY_SURFACE)
@@ -256,6 +259,7 @@ class _CallbackRunner:
 async def test_callback_routes_through_runner_command_path(monkeypatch):
     adapter = _make_adapter(monkeypatch)
     runner = _CallbackRunner()
+    adapter.gateway_runner = runner
     adapter.set_message_handler(runner._handle_message)
     adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="78"))
     query = SimpleNamespace(
@@ -277,6 +281,8 @@ async def test_callback_routes_through_runner_command_path(monkeypatch):
 
     assert runner.events[0].text == "/memory approve abc12345"
     assert runner.events[0].message_type == MessageType.COMMAND
+    assert runner.events[0].source.profile == "routed-profile"
+    assert runner.events[0].source._transport_adapter_ref() is adapter
     adapter.send.assert_awaited_once()
     assert adapter.send.call_args.args[1] == "Approved 1 memory write(s)."
     assert adapter.send.call_args.kwargs["metadata"]["write_approval"] == MEMORY_SURFACE
