@@ -4375,7 +4375,7 @@ class TelegramAdapter(BasePlatformAdapter):
             self._handle_location_message
         ))
         app.add_handler(TelegramMessageHandler(
-            self._media_message_filter(filters),
+            self._media_message_filter(),
             self._handle_media_message
         ))
         # PTB 22.x does not model Bot API guest_message yet.
