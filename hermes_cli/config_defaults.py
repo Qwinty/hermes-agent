@@ -1786,6 +1786,12 @@ DEFAULT_CONFIG = {
                                      # (floor 30s) to enforce a hard cap.
         "reasoning_effort": "",  # subagent effort: "ultra", "max", "xhigh", "high",
                                  # "medium", "low", "minimal", "none" (empty = inherit)
+        # Local named routes let the model select an operator-controlled
+        # provider/model/reasoning bundle without exposing arbitrary model IDs.
+        # The reserved route name "inherit" always keeps the parent model and
+        # reasoning. An empty default preserves legacy delegation.* pinning.
+        "default_route": "",
+        "routes": {},
         "max_concurrent_children": 3,  # unified concurrency cap: max parallel children per batch
                                        # AND max concurrent background (background=true)
                                        # delegation units. New async dispatches beyond the cap

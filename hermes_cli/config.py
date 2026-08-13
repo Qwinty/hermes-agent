@@ -4976,6 +4976,11 @@ _DYNAMIC_TOP_LEVEL_KEYS = frozenset({
 # accepted because ``PlatformConfig`` carries an open ``extra`` mapping.
 _PLATFORM_CONTAINER_KEYS = frozenset({"platforms"})
 
+# Nested mapping paths whose children are user-defined names. Delegation route
+# names and their provider/model fields are operator-owned, like providers.* at
+# the top level, so config-set validation must accept the whole subtree.
+_OPEN_DICT_PATHS = frozenset({"delegation.routes"})
+
 
 def _known_top_level_keys() -> set[str]:
     """Return the union of known top-level config keys for validation.
@@ -5076,6 +5081,8 @@ def _validate_config_key(key: str) -> tuple[bool, Optional[str]]:
     node: Any = DEFAULT_CONFIG.get(top)
     consumed = [top]
     for seg in segments[1:]:
+        if ".".join(consumed) in _OPEN_DICT_PATHS:
+            return True, None
         # ``gateway.platforms.<name>.<field>`` (and any other nested
         # ``platforms`` container) — the segment after ``platforms`` is a
         # user-supplied platform name, so accept everything below it.

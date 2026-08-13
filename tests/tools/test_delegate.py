@@ -58,6 +58,16 @@ def _make_mock_parent(depth=0):
 
 class TestDelegateRequirements(unittest.TestCase):
 
+    def test_route_config_keys_are_declared(self):
+        from hermes_cli.config import DEFAULT_CONFIG, _validate_config_key
+
+        self.assertEqual(DEFAULT_CONFIG["delegation"]["default_route"], "")
+        self.assertEqual(DEFAULT_CONFIG["delegation"]["routes"], {})
+        self.assertEqual(
+            _validate_config_key("delegation.routes.scout.provider"),
+            (True, None),
+        )
+
     def test_schema_valid(self):
         self.assertEqual(DELEGATE_TASK_SCHEMA["name"], "delegate_task")
         props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
