@@ -250,11 +250,13 @@ async def test_secondary_adapter_busy_guard_stamps_profile_before_resolving_mode
         "steer",
     )
     event = _event(profile=None)
-    adapter_session_key = build_session_key(event.source)
-    adapter._active_sessions[adapter_session_key] = asyncio.Event()
 
     routed_source = _event(profile="research").source
     routed_session_key = runner._session_key_for_source(routed_source)
+    # The owning profile is stamped before session-key derivation, so the live
+    # adapter guard is indexed by the routed (profile-scoped) key.
+    adapter._active_sessions[routed_session_key] = asyncio.Event()
+    adapter._session_tasks[routed_session_key] = asyncio.current_task()
     agent = MagicMock()
     agent._active_children = []
     agent.steer.return_value = True

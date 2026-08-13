@@ -697,7 +697,8 @@ class TestRegisterHandlers:
         calls = app.add_handler.call_args_list
         assert len(calls) == 7
         assert len([c for c in calls if c.kwargs.get("group") == 99]) == 1
-        assert len([c for c in calls if not c.kwargs]) == 6
+        assert len([c for c in calls if not c.kwargs]) == 5
+        assert len([c for c in calls if c.kwargs.get("group") == 1]) == 1
 
     def test_rebuild_re_registers_observer(self):
         """A second call on a fresh app (e.g. a future rebuild) re-registers
