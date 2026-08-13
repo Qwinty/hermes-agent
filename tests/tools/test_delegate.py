@@ -64,6 +64,8 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn("goal", props)
         self.assertIn("tasks", props)
         self.assertIn("context", props)
+        self.assertIn("route", props)
+        self.assertIn("route", props["tasks"]["items"]["properties"])
         # toolsets is intentionally NOT exposed to the model — subagents always
         # inherit the parent's toolsets. Letting the model name toolsets was a
         # capability-selection surface the model should not control.
@@ -103,7 +105,7 @@ class TestDelegateRequirements(unittest.TestCase):
             "fetch the URL",       # concrete verification verbs
             "clarify",             # leaf blocked-tool list
             "send_message",
-            "delegation.provider", # model inheritance / pinning
+            "inherit",             # model inheritance / route contract
         ):
             self.assertIn(keyword, desc, f"top-level description lost: {keyword!r}")
 
@@ -118,6 +120,10 @@ class TestDelegateRequirements(unittest.TestCase):
             patch("tools.delegate_tool._get_max_concurrent_children", return_value=7),
             patch("tools.delegate_tool._get_max_spawn_depth", return_value=4),
             patch("tools.delegate_tool._get_orchestrator_enabled", return_value=True),
+            patch(
+                "tools.delegate_tool._load_config",
+                return_value={"routes": {"scout": {}, "reviewer": {}}},
+            ),
         ):
             overrides = _build_dynamic_schema_overrides()
             definition = registry.get_definitions({"delegate_task"})[0]["function"]
@@ -126,6 +132,14 @@ class TestDelegateRequirements(unittest.TestCase):
             self.assertIn("up to 7", parameters["properties"]["tasks"]["description"])
             self.assertIn(
                 "max_spawn_depth=4", parameters["properties"]["role"]["description"]
+            )
+            self.assertEqual(
+                parameters["properties"]["route"]["enum"],
+                ["inherit", "reviewer", "scout"],
+            )
+            self.assertEqual(
+                parameters["properties"]["tasks"]["items"]["properties"]["route"]["enum"],
+                ["inherit", "reviewer", "scout"],
             )
         # Static top-level text must not embed stale limits.
         self.assertNotIn("up to 7", overrides["description"])
@@ -1217,6 +1231,219 @@ class TestDelegationReasoningEffort(unittest.TestCase):
         call_kwargs = MockAgent.call_args[1]
         self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "low"})
 
+
+class TestDelegationRoutes(unittest.TestCase):
+    """Local config-driven model routes for delegated children."""
+
+    def test_inherit_route_clears_global_model_pin_and_inherits_reasoning(self):
+        from tools.delegate_tool import _resolve_delegation_route_config
+
+        cfg = {
+            "model": "global-cheap-model",
+            "provider": "global-provider",
+            "reasoning_effort": "low",
+            "default_route": "inherit",
+            "routes": {
+                "scout": {
+                    "provider": "cliproxyapi",
+                    "model": "gpt-5.6-terra",
+                    "reasoning_effort": "medium",
+                },
+            },
+        }
+
+        routed, route_name, reasoning_override = _resolve_delegation_route_config(
+            cfg, "inherit"
+        )
+
+        self.assertEqual(route_name, "inherit")
+        self.assertEqual(routed["model"], "")
+        self.assertEqual(routed["provider"], "")
+        self.assertEqual(routed["base_url"], "")
+        self.assertEqual(routed["api_key"], "")
+        self.assertIsNone(reasoning_override)
+
+    def test_named_route_overrides_global_model_and_reasoning(self):
+        from tools.delegate_tool import _resolve_delegation_route_config
+
+        cfg = {
+            "model": "global-model",
+            "provider": "global-provider",
+            "reasoning_effort": "low",
+            "routes": {
+                "reviewer": {
+                    "provider": "cliproxyapi",
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "high",
+                },
+            },
+        }
+
+        routed, route_name, reasoning_override = _resolve_delegation_route_config(
+            cfg, "reviewer"
+        )
+
+        self.assertEqual(route_name, "reviewer")
+        self.assertEqual(routed["provider"], "cliproxyapi")
+        self.assertEqual(routed["model"], "gpt-5.6-sol")
+        self.assertEqual(routed.get("base_url"), "")
+        self.assertEqual(routed.get("api_key"), "")
+        self.assertEqual(reasoning_override, "high")
+
+    def test_unknown_route_is_rejected_with_available_names(self):
+        from tools.delegate_tool import _resolve_delegation_route_config
+
+        cfg = {"routes": {"scout": {}, "reviewer": {}}}
+        with self.assertRaisesRegex(ValueError, "reviewer.*scout"):
+            _resolve_delegation_route_config(cfg, "expensive")
+
+    def test_route_without_reasoning_effort_inherits_parent(self):
+        from tools.delegate_tool import _resolve_delegation_route_config
+
+        cfg = {
+            "reasoning_effort": "low",
+            "routes": {
+                "custom": {
+                    "provider": "cliproxyapi",
+                    "model": "gpt-5.6-sol",
+                },
+            },
+        }
+
+        routed, route_name, reasoning_override = _resolve_delegation_route_config(
+            cfg, "custom"
+        )
+
+        self.assertEqual(route_name, "custom")
+        self.assertEqual(routed["reasoning_effort"], "low")
+        self.assertIsNone(reasoning_override)
+
+    def test_top_level_route_is_applied_to_single_task(self):
+        parent = _make_mock_parent()
+        cfg = {
+            "max_iterations": 50,
+            "routes": {
+                "reviewer": {
+                    "provider": "cliproxyapi",
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "high",
+                },
+            },
+        }
+        creds = {
+            "model": "gpt-5.6-sol",
+            "provider": "cliproxyapi",
+            "base_url": "http://127.0.0.1:8317/v1",
+            "api_key": "test-key",
+            "api_mode": "chat_completions",
+            "request_overrides": None,
+            "max_output_tokens": None,
+        }
+        child = MagicMock()
+        child.model = "gpt-5.6-sol"
+        child._delegate_role = "leaf"
+        child.run_conversation.return_value = {
+            "final_response": "ok",
+            "completed": True,
+            "api_calls": 1,
+        }
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value=cfg),
+            patch(
+                "tools.delegate_tool._resolve_delegation_credentials",
+                return_value=creds,
+            ),
+            patch(
+                "tools.delegate_tool._build_child_preserving_parent_tools",
+                return_value=child,
+            ) as mock_build,
+        ):
+            result = json.loads(
+                delegate_task(
+                    goal="Review",
+                    route="reviewer",
+                    background=False,
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertEqual(result["results"][0]["model"], "gpt-5.6-sol")
+        self.assertEqual(mock_build.call_args.kwargs["model"], "gpt-5.6-sol")
+        self.assertEqual(
+            mock_build.call_args.kwargs["reasoning_effort_override"], "high"
+        )
+
+    @patch("tools.delegate_tool._build_child_preserving_parent_tools")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._load_config")
+    def test_mixed_batch_routes_each_child_independently(
+        self, mock_cfg, mock_credentials, mock_build
+    ):
+        mock_cfg.return_value = {
+            "max_iterations": 50,
+            "default_route": "inherit",
+            "routes": {
+                "scout": {
+                    "provider": "cliproxyapi",
+                    "model": "gpt-5.6-terra",
+                    "reasoning_effort": "medium",
+                },
+                "reviewer": {
+                    "provider": "cliproxyapi",
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "high",
+                },
+            },
+        }
+
+        def credentials(route_cfg, _parent):
+            return {
+                "model": route_cfg.get("model") or None,
+                "provider": route_cfg.get("provider") or None,
+                "base_url": None,
+                "api_key": None,
+                "api_mode": None,
+                "request_overrides": None,
+                "max_output_tokens": None,
+            }
+
+        mock_credentials.side_effect = credentials
+        children = []
+        for model in ("gpt-5.6-terra", "gpt-5.6-sol"):
+            child = MagicMock()
+            child.model = model
+            child._delegate_role = "leaf"
+            child.run_conversation.return_value = {
+                "final_response": "ok",
+                "completed": True,
+                "api_calls": 1,
+            }
+            children.append(child)
+        mock_build.side_effect = children
+
+        result = json.loads(
+            delegate_task(
+                tasks=[
+                    {"goal": "Find files", "route": "scout"},
+                    {"goal": "Review changes", "route": "reviewer"},
+                ],
+                background=False,
+                parent_agent=_make_mock_parent(),
+            )
+        )
+
+        self.assertEqual([entry["status"] for entry in result["results"]], ["completed", "completed"])
+        self.assertEqual(
+            [entry["model"] for entry in result["results"]],
+            ["gpt-5.6-terra", "gpt-5.6-sol"],
+        )
+        calls = mock_build.call_args_list
+        self.assertEqual(calls[0].kwargs["model"], "gpt-5.6-terra")
+        self.assertEqual(calls[0].kwargs["reasoning_effort_override"], "medium")
+        self.assertEqual(calls[1].kwargs["model"], "gpt-5.6-sol")
+        self.assertEqual(calls[1].kwargs["reasoning_effort_override"], "high")
+
 # =========================================================================
 # Dispatch helper, progress events, concurrency
 # =========================================================================
@@ -1240,6 +1467,7 @@ class TestDispatchDelegateTask(unittest.TestCase):
                 parent,
                 {
                     "goal": "test",
+                    "route": "reviewer",
                     "acp_command": "claude",
                     "acp_args": ["--acp", "--stdio"],
                     "tasks": [
@@ -1255,6 +1483,7 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertNotIn("acp_command", captured)
         self.assertNotIn("acp_args", captured)
         self.assertEqual(captured["goal"], "test")
+        self.assertEqual(captured["route"], "reviewer")
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
 
