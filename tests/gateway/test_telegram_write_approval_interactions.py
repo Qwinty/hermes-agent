@@ -271,6 +271,11 @@ async def test_callback_routes_through_runner_command_path(monkeypatch):
     )
     adapter.set_message_handler(profile_scoped_handler)
     assert not hasattr(profile_scoped_handler, "__self__")
+    await adapter.send(
+        "12345",
+        "Pending memory writes (1): abc12345",
+        metadata={"write_approval": MEMORY_SURFACE},
+    )
     adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="78"))
     query = SimpleNamespace(
         data="wa:m:a:abc12345",

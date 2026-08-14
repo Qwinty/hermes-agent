@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Iterable, Mapping, Optional
+from dataclasses import dataclass
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 
 WRITE_APPROVAL_METADATA_KEY = "write_approval"
@@ -47,7 +48,138 @@ def normalize_surface(surface: Any) -> Optional[dict]:
 
     if not subsystems:
         return None
-    return {"subsystems": subsystems, "items": items}
+    normalized = {"subsystems": subsystems, "items": items}
+    raw_scope = surface.get("scope")
+    if isinstance(raw_scope, Mapping):
+        scope = {
+            "session_key": str(raw_scope.get("session_key") or ""),
+            "profile": str(raw_scope.get("profile") or "default"),
+            "chat_id": str(raw_scope.get("chat_id") or ""),
+            "thread_id": str(raw_scope.get("thread_id") or ""),
+        }
+        generation = raw_scope.get("run_generation")
+        if isinstance(generation, int):
+            scope["run_generation"] = generation
+        normalized["scope"] = scope
+    return normalized
+
+
+@dataclass(frozen=True)
+class ApprovalCard:
+    text: str
+    surface: dict
+
+
+def _target_label(event: Mapping[str, Any]) -> str:
+    if event.get("subsystem") == "memory":
+        return "USER.md" if event.get("target") == "user" else "MEMORY.md"
+    name = str(event.get("target") or "skill library")
+    return f"skill {name}"
+
+
+def approval_card_for_events(events: Sequence[Mapping[str, Any]]) -> Optional[ApprovalCard]:
+    """Render one deterministic card from the exact records emitted by a turn."""
+    valid = []
+    seen = set()
+    for event in events:
+        if not isinstance(event, Mapping):
+            continue
+        pending_id = str(event.get("pending_id") or "").lower()
+        subsystem = str(event.get("subsystem") or "").lower()
+        if (
+            subsystem not in _SUBSYSTEMS
+            or not _PENDING_ID_RE.fullmatch(pending_id)
+            or (subsystem, pending_id) in seen
+        ):
+            continue
+        seen.add((subsystem, pending_id))
+        valid.append(dict(event))
+    if not valid:
+        return None
+
+    items: dict[str, list[str]] = {}
+    subsystems: list[str] = []
+    for event in valid:
+        subsystem = event["subsystem"]
+        if subsystem not in subsystems:
+            subsystems.append(subsystem)
+        items.setdefault(subsystem, []).append(event["pending_id"])
+
+    first = valid[0]
+    scope = {
+        "session_key": str(first.get("session_key") or ""),
+        "run_generation": first.get("run_generation"),
+        "profile": str(first.get("profile") or "default"),
+    }
+    surface = normalize_surface(
+        {"subsystems": subsystems, "items": items, "scope": scope}
+    )
+    if surface is None:
+        return None
+
+    lines = ["💾 **Memory proposal**" if subsystems == ["memory"] else "💾 **Write proposal**"]
+    for event in valid:
+        operation = str(event.get("operation") or "change").capitalize()
+        preview = str(event.get("preview") or "(no preview)")
+        lines.extend(
+            [
+                f"{operation} in {_target_label(event)}:",
+                f"“{preview}”",
+                f"ID: `{event['pending_id']}`",
+            ]
+        )
+    return ApprovalCard(text="\n".join(lines), surface=surface)
+
+
+async def deliver_staged_write_cards(
+    *,
+    adapter: Any,
+    source: Any,
+    reply_to_message_id: Optional[str],
+    events: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Send one turn-owned approval card per exact record in the source topic."""
+    if adapter is None:
+        return False
+    from gateway.platforms.base import (
+        _mark_notify_metadata,
+        _thread_metadata_for_source,
+    )
+
+    sent_any = False
+    all_succeeded = True
+    for event in events:
+        card = approval_card_for_events([event])
+        if card is None:
+            continue
+        sent_any = True
+        surface = dict(card.surface)
+        scope = dict(surface.get("scope") or {})
+        scope.update(
+            {
+                "chat_id": str(getattr(source, "chat_id", "") or ""),
+                "thread_id": str(getattr(source, "thread_id", "") or ""),
+                "profile": str(
+                    getattr(source, "profile", None)
+                    or scope.get("profile")
+                    or "default"
+                ),
+            }
+        )
+        surface["scope"] = scope
+        metadata = dict(
+            _thread_metadata_for_source(source, reply_to_message_id) or {}
+        )
+        metadata[WRITE_APPROVAL_METADATA_KEY] = surface
+        metadata = _mark_notify_metadata(metadata)
+        result = await adapter.send(
+            str(getattr(source, "chat_id", "")),
+            card.text,
+            reply_to=reply_to_message_id,
+            metadata=metadata,
+        )
+        all_succeeded = all_succeeded and bool(getattr(result, "success", False))
+    return sent_any and all_succeeded
 
 
 def build_pending_surface(subsystems: Iterable[str]) -> Optional[dict]:

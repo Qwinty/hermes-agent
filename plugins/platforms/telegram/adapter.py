@@ -1330,6 +1330,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if surface is None:
             return None, None
 
+        # ``scope`` is part of the ownership proof for generated cards. Keep it
+        # in adapter state, but buttons need only the compact pending id.
         rows = []
         for subsystem in surface["subsystems"]:
             code = "m" if subsystem == "memory" else "s"
@@ -7667,6 +7669,31 @@ class TelegramAdapter(BasePlatformAdapter):
                 text="⛔ You are not authorized to review staged writes."
             )
             return
+
+        prompt_message_id = getattr(query.message, "message_id", None)
+        approval_surface = self._lookup_write_approval_surface(
+            str(query_chat_id or ""), str(prompt_message_id or "")
+        )
+        normalized_surface = normalize_surface(approval_surface)
+        if normalized_surface is None:
+            await query.answer(text="⚠️ This approval card expired — open /memory pending.")
+            return
+        command_parts = command_text.split()
+        pending_id = command_parts[-1].lower() if command_parts else ""
+        subsystem = "memory" if command_text.startswith("/memory ") else "skills"
+        scope = (normalized_surface or {}).get("scope") or {}
+        scoped_ids = normalized_surface.get("items", {}).get(subsystem, [])
+        chat_matches = not scope.get("chat_id") or str(query_chat_id or "") == str(
+            scope.get("chat_id")
+        )
+        thread_matches = not scope.get("thread_id") or str(query_thread_id or "") == str(
+            scope.get("thread_id")
+        )
+        pending_matches = pending_id in scoped_ids
+        if not (chat_matches and thread_matches and pending_matches):
+            await query.answer(text="⚠️ This approval card expired or belongs to another topic.")
+            return
+
         if not callable(getattr(self, "_message_handler", None)):
             await query.answer(text="Gateway command handler is unavailable.")
             return
@@ -7682,6 +7709,24 @@ class TelegramAdapter(BasePlatformAdapter):
             ),
             user_name=query_user_name,
         )
+        if scope.get("profile"):
+            source.profile = str(scope["profile"])
+        if scope.get("session_key"):
+            from gateway.session import build_session_key
+
+            actual_session_key = build_session_key(
+                source,
+                group_sessions_per_user=self.config.extra.get(
+                    "group_sessions_per_user", True
+                ),
+                thread_sessions_per_user=self.config.extra.get(
+                    "thread_sessions_per_user", False
+                ),
+                profile=source.profile,
+            )
+            if actual_session_key != str(scope["session_key"]):
+                await query.answer(text="⚠️ This approval card expired or belongs to another session.")
+                return
         prompt_message_id = getattr(query.message, "message_id", None)
         source.message_id = (
             str(prompt_message_id) if prompt_message_id is not None else None
@@ -7697,7 +7742,19 @@ class TelegramAdapter(BasePlatformAdapter):
 
         await query.answer(text="Processing write-approval action…")
         try:
-            response = await self._message_handler(event)
+            runner = getattr(self, "gateway_runner", None)
+            profile_home = None
+            if runner is not None and callable(
+                getattr(runner, "_resolve_profile_home_for_source", None)
+            ):
+                profile_home = runner._resolve_profile_home_for_source(source)
+            if profile_home is not None:
+                from gateway.run import _profile_runtime_scope
+
+                with _profile_runtime_scope(profile_home):
+                    response = await self._message_handler(event)
+            else:
+                response = await self._message_handler(event)
         except Exception as exc:
             logger.error(
                 "[%s] write-approval callback dispatch failed: %s",
@@ -7709,18 +7766,46 @@ class TelegramAdapter(BasePlatformAdapter):
         if not response or query_chat_id is None:
             return
 
+        response_text = str(response)
+        action_code = data.split(":", 3)[2].lower()
+        resolved = (
+            (action_code == "a" and response_text.startswith("Approved "))
+            or (action_code == "r" and response_text.startswith("Rejected "))
+        )
+        if resolved:
+            status = "✅ Approved" if action_code == "a" else "❌ Rejected"
+            original_text = str(getattr(query.message, "text", "") or "").strip()
+            edited_text = f"{original_text}\n\n{status}" if original_text else status
+            try:
+                await query.edit_message_text(
+                    text=edited_text,
+                    reply_markup=None,
+                )
+                store = getattr(self, "_write_approval_surfaces", None)
+                if isinstance(store, OrderedDict):
+                    store.pop(
+                        (str(query_chat_id), str(prompt_message_id)), None
+                    )
+                return
+            except Exception:
+                logger.debug(
+                    "[%s] failed to edit resolved write-approval card",
+                    self.name,
+                    exc_info=True,
+                )
+
         metadata = _thread_metadata_for_source(source, source.message_id)
         metadata = merge_response_delivery_metadata(metadata, response)
         metadata = dict(metadata or {})
         metadata["notify"] = True
         await self.send(
             str(query_chat_id),
-            str(response),
+            response_text,
             reply_to=source.message_id,
             metadata=metadata,
         )
 
-        if data.split(":", 3)[2].lower() in {"a", "r"}:
+        if resolved:
             try:
                 await query.edit_message_reply_markup(reply_markup=None)
             except Exception:

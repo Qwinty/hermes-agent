@@ -2698,9 +2698,8 @@ from gateway.shutdown_watchdog import (
     start_loop_liveness_watchdog,
 )
 from gateway.write_approval_interactions import (
-    WRITE_APPROVAL_METADATA_KEY,
     WriteApprovalReply,
-    build_pending_surface,
+    deliver_staged_write_cards,
 )
 from gateway.restart import (
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT,
@@ -4222,6 +4221,33 @@ def _should_clear_resume_pending_after_turn(agent_result: dict) -> bool:
     if agent_result.get("completed") is False:
         return False
     return True
+
+
+def _merge_staged_write_events(current_result: dict, followup_result: dict) -> dict:
+    """Keep exact staged-write records from every turn in an in-band drain."""
+    if not isinstance(followup_result, dict):
+        return followup_result
+    current_events = (
+        current_result.get("staged_write_events", [])
+        if isinstance(current_result, dict)
+        else []
+    )
+    followup_events = followup_result.get("staged_write_events", [])
+    combined = []
+    seen = set()
+    for event in [*current_events, *followup_events]:
+        if not isinstance(event, dict):
+            continue
+        key = (str(event.get("subsystem") or ""), str(event.get("pending_id") or ""))
+        if not key[1] or key in seen:
+            continue
+        seen.add(key)
+        combined.append(dict(event))
+    if not combined:
+        return followup_result
+    merged = dict(followup_result)
+    merged["staged_write_events"] = combined
+    return merged
 
 
 def _preserve_queued_followup_history_offset(
@@ -5955,26 +5981,67 @@ class TurnRunner:
         _bg_review_pending: list[str] = []
         _bg_review_pending_lock = threading.Lock()
 
+        def _pending_staged_write_events() -> list[dict]:
+            lock = ctx.staged_write_events_lock
+            if lock is None:
+                snapshot = list(ctx.staged_write_events)
+            else:
+                with lock:
+                    snapshot = list(ctx.staged_write_events)
+            pending = []
+            for event in snapshot:
+                pending_id = str(event.get("pending_id") or "")
+                if pending_id and pending_id not in ctx.delivered_staged_write_ids:
+                    pending.append(event)
+            return pending
+
+        async def _deliver_staged_write_events() -> None:
+            if not ctx._status_adapter or not ctx._run_still_current():
+                return
+            delivery_lock = ctx.staged_write_delivery_lock
+            if delivery_lock is None:
+                return
+            async with delivery_lock:
+                events = _pending_staged_write_events()
+                if not events:
+                    return
+                delivered = await deliver_staged_write_cards(
+                    adapter=ctx._status_adapter,
+                    source=ctx.source,
+                    reply_to_message_id=ctx.event_message_id,
+                    events=events,
+                )
+                if delivered:
+                    ctx.delivered_staged_write_ids.update(
+                        str(event.get("pending_id") or "") for event in events
+                    )
+                else:
+                    # Best-effort retry on reconnect/transient send failure. The
+                    # adapter owns cleanup; this callback is bounded and keeps the
+                    # exact same turn-owned IDs rather than re-scanning pending/.
+                    await asyncio.sleep(1.0)
+                    if ctx._run_still_current():
+                        retry_delivered = await deliver_staged_write_cards(
+                            adapter=ctx._status_adapter,
+                            source=ctx.source,
+                            reply_to_message_id=ctx.event_message_id,
+                            events=events,
+                        )
+                        if retry_delivered:
+                            ctx.delivered_staged_write_ids.update(
+                                str(event.get("pending_id") or "") for event in events
+                            )
+
         def _deliver_bg_review_message(message: str) -> None:
             if not ctx._status_adapter or not ctx._run_still_current():
                 return
             async def _deliver() -> None:
-                metadata = _non_conversational_metadata(
-                    ctx._status_thread_metadata,
-                    platform=ctx.source.platform,
-                )
-                surface = await asyncio.to_thread(
-                    build_pending_surface,
-                    ("memory", "skills"),
-                )
-                if surface:
-                    metadata = dict(metadata or {})
-                    metadata[WRITE_APPROVAL_METADATA_KEY] = surface
                 await ctx._status_adapter.send(
                     ctx._status_chat_id,
                     message,
                     metadata=_interim_metadata(metadata),
                 )
+                await _deliver_staged_write_events()
 
             safe_schedule_threadsafe(
                 _deliver(),
@@ -5990,6 +6057,14 @@ class TurnRunner:
                 _bg_review_pending.clear()
             for queued in pending:
                 _deliver_bg_review_message(queued)
+            # Foreground memory/skill writes produce no background-review summary.
+            # Their exact staged events still need a card after the main reply.
+            safe_schedule_threadsafe(
+                _deliver_staged_write_events(),
+                ctx._loop_for_step,
+                logger=logger,
+                log_message="staged-write card scheduling error",
+            )
 
         # Background review delivery — send "💾 Memory updated" etc. to user
         def _bg_review_send(message: str) -> None:
@@ -6438,63 +6513,57 @@ class TurnRunner:
         _approval_session_key = ctx.session_key or ""
         _approval_session_token = set_current_session_key(_approval_session_key)
         register_gateway_notify(_approval_session_key, _approval_notify_sync)
-        try:
-            # If _prepare_inbound_message_text buffered image paths for native
-            # attachment, wrap the user turn as an OpenAI-style multimodal
-            # content list. Consume-and-clear so subsequent turns on the same
-            # runner instance don't re-attach stale images.
-            _native_imgs = self._runner._consume_pending_native_image_paths(ctx.session_key)
-            if _native_imgs:
-                try:
-                    from agent.image_routing import build_native_content_parts
-                    _parts, _skipped = build_native_content_parts(
-                        ctx.message,
-                        _native_imgs,
-                    )
-                    if _skipped:
-                        logger.warning(
-                            "Native image attachment: skipped %d unreadable path(s): %s",
-                            len(_skipped), _skipped,
-                        )
-                    if any(p.get("type") == "image_url" for p in _parts):
-                        _run_message: Any = _parts
-                    else:
-                        # All images failed to read — fall back to plain text.
-                        _run_message = ctx.message
-                except Exception as _img_exc:
-                    logger.warning(
-                        "Native image attachment failed, falling back to text: %s",
-                        _img_exc,
-                    )
-                    _run_message = ctx.message
-            else:
-                _run_message = ctx.message
+        from tools import write_approval as _write_approval
 
-            _api_run_message = _wrap_current_message_with_observed_context(
-                _run_message,
-                observed_group_context,
-            )
-            _conversation_kwargs = {
-                "conversation_history": agent_history,
-                "task_id": ctx.session_id,
-            }
-            if _persist_user_message_override is not None:
-                _conversation_kwargs["persist_user_message"] = _persist_user_message_override
-            elif observed_group_context:
-                _conversation_kwargs["persist_user_message"] = ctx.message
-            if ctx.persist_user_display_kind:
-                # Internal self-injected turn (#82888): type the persisted user
-                # row at turn start so UIs render it as a timeline notice, not
-                # a user bubble. Role/content are untouched and the key is
-                # stripped from provider-bound payloads in conversation_loop.
-                _conversation_kwargs["persist_user_display_kind"] = (
-                    ctx.persist_user_display_kind
+        def _capture_staged_write(event: dict) -> None:
+            lock = ctx.staged_write_events_lock
+            if lock is None:
+                ctx.staged_write_events.append(dict(event))
+            else:
+                with lock:
+                    ctx.staged_write_events.append(dict(event))
+            if _bg_review_release.is_set():
+                safe_schedule_threadsafe(
+                    _deliver_staged_write_events(),
+                    ctx._loop_for_step,
+                    logger=logger,
+                    log_message="late staged-write card scheduling error",
                 )
-            if ctx.moa_config is not None:
-                _conversation_kwargs["moa_config"] = ctx.moa_config
-            if _persist_user_timestamp_override is not None:
-                _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-            result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+
+        try:
+            with _write_approval.capture_staged_writes(
+                session_key=ctx.session_key or "",
+                run_generation=ctx.run_generation,
+                profile=str(getattr(ctx.source, "profile", None) or "default"),
+                callback=_capture_staged_write,
+            ):
+                _native_imgs = self._runner._consume_pending_native_image_paths(ctx.session_key)
+                if _native_imgs:
+                    try:
+                        from agent.image_routing import build_native_content_parts
+                        _parts, _skipped = build_native_content_parts(ctx.message, _native_imgs)
+                        if _skipped:
+                            logger.warning("Native image attachment: skipped %d unreadable path(s): %s", len(_skipped), _skipped)
+                        _run_message: Any = _parts if any(p.get("type") == "image_url" for p in _parts) else ctx.message
+                    except Exception as _img_exc:
+                        logger.warning("Native image attachment failed, falling back to text: %s", _img_exc)
+                        _run_message = ctx.message
+                else:
+                    _run_message = ctx.message
+
+                _api_run_message = _wrap_current_message_with_observed_context(_run_message, observed_group_context)
+                _conversation_kwargs = {"conversation_history": agent_history, "task_id": ctx.session_id}
+                if _persist_user_message_override is not None:
+                    _conversation_kwargs["persist_user_message"] = _persist_user_message_override
+                elif observed_group_context:
+                    _conversation_kwargs["persist_user_message"] = ctx.message
+                if ctx.persist_user_display_kind:
+                    _conversation_kwargs["persist_user_display_kind"] = ctx.persist_user_display_kind
+                if ctx.moa_config is not None:
+                    _conversation_kwargs["moa_config"] = ctx.moa_config
+                if _persist_user_timestamp_override is not None:
+                    _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+                result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent
@@ -6702,6 +6771,7 @@ class TurnRunner:
                 "output_tokens": _output_toks,
                 "model": _resolved_model,
                 "context_length": _context_length,
+                "staged_write_events": list(ctx.staged_write_events),
             }
 
         # Scan tool results for MEDIA:<path> tags that need to be delivered
@@ -6786,6 +6856,7 @@ class TurnRunner:
             "session_id": effective_session_id,
             "response_previewed": result.get("response_previewed", False),
             "response_transformed": result.get("response_transformed", False),
+            "staged_write_events": list(ctx.staged_write_events),
             # Pass through the agent_persisted flag so the persistence block
             # above can correctly determine whether the codex app-server path
             # self-persisted (it didn't — see codex_runtime.py).  Default
@@ -28802,6 +28873,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
+            staged_write_events_lock=threading.Lock(),
+            staged_write_delivery_lock=asyncio.Lock(),
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to
@@ -30035,6 +30108,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message_type=next_message_type,
                     guest_mode_invocation=guest_mode_invocation,
                 )
+                followup_result = _merge_staged_write_events(result, followup_result)
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
             # Stop progress sender, interrupt monitor, and notification task
