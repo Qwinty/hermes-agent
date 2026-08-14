@@ -244,16 +244,22 @@ class TestConfiguredCamofoxIdentity:
         )
 
 
-    def test_soft_cleanup_preserves_externally_managed_session(self, tmp_path, monkeypatch):
+    def test_soft_cleanup_closes_tabs_but_preserves_externally_managed_session(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
         monkeypatch.setenv("CAMOFOX_USER_ID", "shared-camofox")
 
-        with patch("tools.browser_camofox._get", return_value={"tabs": []}):
-            _get_session("task-1")
-        result = camofox_soft_cleanup("task-1")
+        with (
+            patch("tools.browser_camofox._get", return_value={"tabs": []}),
+            patch("tools.browser_camofox._delete") as mock_delete,
+        ):
+            session = _get_session("task-1")
+            result = camofox_soft_cleanup("task-1")
 
         assert result is True
+        mock_delete.assert_called_once_with(
+            f"/tabs/group/{session['session_key']}", {"userId": "shared-camofox"}
+        )
         import tools.browser_camofox as mod
         with mod._sessions_lock:
             assert "task-1" not in mod._sessions
@@ -287,33 +293,61 @@ class TestVncUrlDiscovery:
 
 
 class TestCamofoxSoftCleanup:
-    """camofox_soft_cleanup drops local state only when managed persistence is on."""
+    """Soft cleanup closes task tabs while preserving persistent profiles."""
 
-    def test_returns_true_and_drops_session_when_enabled(self, tmp_path, monkeypatch):
+    def test_returns_true_closes_group_and_drops_local_session_when_enabled(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
 
-        with _enable_persistence():
-            _get_session("task-1")
+        with _enable_persistence(), patch("tools.browser_camofox._delete") as mock_delete:
+            session = _get_session("task-1")
             result = camofox_soft_cleanup("task-1")
 
         assert result is True
-        # Session should have been dropped from in-memory store
+        mock_delete.assert_called_once_with(
+            f"/tabs/group/{session['session_key']}", {"userId": session["user_id"]}
+        )
         import tools.browser_camofox as mod
         with mod._sessions_lock:
             assert "task-1" not in mod._sessions
 
 
-    def test_does_not_call_server_delete(self, tmp_path, monkeypatch):
-        """Soft cleanup must never hit the Camofox /sessions DELETE endpoint."""
+    def test_never_deletes_persistent_user_session(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
 
         with (
             _enable_persistence(),
-            patch("tools.browser_camofox.requests.delete") as mock_delete,
+            patch("tools.browser_camofox._delete") as mock_delete,
         ):
+            session = _get_session("task-1")
+            camofox_soft_cleanup("task-1")
+
+        path, body = mock_delete.call_args.args
+        assert path == f"/tabs/group/{session['session_key']}"
+        assert not path.startswith("/sessions/")
+        assert body == {"userId": session["user_id"]}
+
+    def test_quotes_external_session_key_in_group_path(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+        monkeypatch.setenv("CAMOFOX_USER_ID", "shared-camofox")
+        monkeypatch.setenv("CAMOFOX_SESSION_KEY", "shared/task key")
+
+        with patch("tools.browser_camofox._delete") as mock_delete:
             _get_session("task-1")
             camofox_soft_cleanup("task-1")
 
-        mock_delete.assert_not_called()
+        assert mock_delete.call_args.args[0] == "/tabs/group/shared%2Ftask%20key"
+
+    def test_cleanup_failure_still_drops_local_state(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+
+        with _enable_persistence(), patch("tools.browser_camofox._delete", side_effect=OSError("offline")):
+            _get_session("task-1")
+            assert camofox_soft_cleanup("task-1") is True
+
+        import tools.browser_camofox as mod
+        with mod._sessions_lock:
+            assert "task-1" not in mod._sessions

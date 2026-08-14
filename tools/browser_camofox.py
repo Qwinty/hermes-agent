@@ -32,7 +32,7 @@ import os
 import threading
 import uuid
 from typing import Any, Dict, Optional
-from urllib.parse import SplitResult, urlsplit, urlunsplit
+from urllib.parse import SplitResult, quote, urlsplit, urlunsplit
 
 import requests
 
@@ -447,18 +447,32 @@ def _drop_session(task_id: Optional[str]) -> Optional[Dict[str, Any]]:
 
 
 def camofox_soft_cleanup(task_id: Optional[str] = None) -> bool:
-    """Release the in-memory session without destroying the server-side context.
+    """Close a task's tabs without destroying its persistent browser profile.
 
-    When managed persistence is enabled the browser profile (and its cookies)
-    must survive across agent tasks.  This helper drops only the local tracking
-    entry and returns ``True``.  When managed persistence is *not* enabled it
-    does nothing and returns ``False`` so the caller can fall back to
-    :func:`camofox_close`.
+    Managed persistence deliberately keeps the server-side user session so its
+    cookies and local storage survive across turns.  The task's tab group does
+    not need to survive, though: closing it releases page resources immediately
+    while leaving the persistent user context intact.  Cleanup is best-effort
+    because resource teardown must not turn an otherwise successful agent turn
+    into an error.
+
+    When managed persistence is disabled this returns ``False`` so the caller
+    can fall back to :func:`camofox_close`, which removes the ephemeral user
+    session entirely.
     """
     camofox_cfg = _get_camofox_config()
     if bool(camofox_cfg.get("managed_persistence")) or _camofox_identity_override(task_id, camofox_cfg):
-        _drop_session(task_id)
-        logger.debug("Camofox soft cleanup for task %s (managed persistence)", task_id)
+        session = _drop_session(task_id)
+        if session:
+            session_key = quote(str(session["session_key"]), safe="")
+            try:
+                _delete(
+                    f"/tabs/group/{session_key}",
+                    {"userId": session["user_id"]},
+                )
+            except Exception as exc:
+                logger.warning("Camofox tab cleanup failed for task %s: %s", task_id, exc)
+        logger.debug("Camofox task tabs closed for %s (managed persistence)", task_id)
         return True
     return False
 
