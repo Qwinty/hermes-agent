@@ -623,6 +623,39 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     assert "the real task" in text
 
 
+def test_batch_completion_formats_each_child_model():
+    evt = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_routes",
+        "is_batch": True,
+        "role": "leaf",
+        "model": "gpt-5.6-sol",
+        "goals": ["scout task", "review task"],
+        "results": [
+            {
+                "task_index": 0,
+                "status": "completed",
+                "summary": "scouted",
+                "model": "gpt-5.6-terra",
+                "duration_seconds": 1.0,
+            },
+            {
+                "task_index": 1,
+                "status": "completed",
+                "summary": "reviewed",
+                "model": "gpt-5.6-sol",
+                "duration_seconds": 2.0,
+            },
+        ],
+    }
+
+    text = format_process_notification(evt)
+
+    assert "Model: mixed" in text
+    assert "model=gpt-5.6-terra" in text
+    assert "model=gpt-5.6-sol" in text
+
+
 def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
     """TUI async delegation must route to the live/compressed agent id.
 
