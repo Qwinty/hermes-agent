@@ -2755,6 +2755,18 @@ def _format_async_delegation(evt: dict) -> str:
         goals = evt.get("goals") or []
         n = len(results) if results else len(goals)
         total_dur = evt.get("total_duration_seconds", duration)
+        result_models = {
+            r.get("model")
+            for r in results
+            if isinstance(r.get("model"), str) and r.get("model")
+        }
+        batch_model = (
+            next(iter(result_models))
+            if len(result_models) == 1
+            else "mixed"
+            if len(result_models) > 1
+            else model
+        )
         lines = [
             f"[ASYNC DELEGATION BATCH COMPLETE — {deleg_id}]",
             f"A background fan-out of {n} subagent(s) you dispatched earlier "
@@ -2771,7 +2783,7 @@ def _format_async_delegation(evt: dict) -> str:
             lines.append(f"Context you provided: {context}")
         if toolsets:
             lines.append(f"Toolsets: {', '.join(toolsets)}")
-        lines.append(f"Role: {role}   Model: {model}   Total duration: {total_dur}s")
+        lines.append(f"Role: {role}   Model: {batch_model}   Total duration: {total_dur}s")
         if error and not results:
             lines.append("--- ERROR ---")
             lines.append(f"The batch did not complete successfully: {error}")
@@ -2793,6 +2805,8 @@ def _format_async_delegation(evt: dict) -> str:
                 header += f", api_calls={r['api_calls']}"
             if r.get("duration_seconds") is not None:
                 header += f", {r['duration_seconds']}s"
+            if r.get("model"):
+                header += f", model={r['model']}"
             if r_truncated:
                 header += ", TRUNCATED: hit max_iterations — work may be incomplete"
             header += ") ---"
