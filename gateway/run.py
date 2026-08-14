@@ -4250,6 +4250,22 @@ def _merge_staged_write_events(current_result: dict, followup_result: dict) -> d
     return merged
 
 
+def _staged_write_delivery_adapter(runner: Any, ctx: TurnContext) -> Any:
+    """Resolve live transport without tying a durable proposal to turn liveness.
+
+    Once ``stage_write`` persists a pending record, its approval card remains
+    owed even if a newer turn increments the session generation. Generation
+    guards still suppress stale model/progress output; they must not hide a
+    durable user-decision request. Prefer the current adapter after reconnect,
+    falling back to the turn's original adapter.
+    """
+    try:
+        current = runner._adapter_for_source(ctx.source)
+    except Exception:
+        current = None
+    return current or ctx._status_adapter
+
+
 def _preserve_queued_followup_history_offset(
     current_result: dict,
     followup_result: dict,
@@ -5996,7 +6012,8 @@ class TurnRunner:
             return pending
 
         async def _deliver_staged_write_events() -> None:
-            if not ctx._status_adapter or not ctx._run_still_current():
+            delivery_adapter = _staged_write_delivery_adapter(self._runner, ctx)
+            if not delivery_adapter:
                 return
             delivery_lock = ctx.staged_write_delivery_lock
             if delivery_lock is None:
@@ -6006,7 +6023,7 @@ class TurnRunner:
                 if not events:
                     return
                 delivered = await deliver_staged_write_cards(
-                    adapter=ctx._status_adapter,
+                    adapter=delivery_adapter,
                     source=ctx.source,
                     reply_to_message_id=ctx.event_message_id,
                     events=events,
@@ -6020,9 +6037,12 @@ class TurnRunner:
                     # adapter owns cleanup; this callback is bounded and keeps the
                     # exact same turn-owned IDs rather than re-scanning pending/.
                     await asyncio.sleep(1.0)
-                    if ctx._run_still_current():
+                    retry_adapter = _staged_write_delivery_adapter(
+                        self._runner, ctx
+                    )
+                    if retry_adapter:
                         retry_delivered = await deliver_staged_write_cards(
-                            adapter=ctx._status_adapter,
+                            adapter=retry_adapter,
                             source=ctx.source,
                             reply_to_message_id=ctx.event_message_id,
                             events=events,

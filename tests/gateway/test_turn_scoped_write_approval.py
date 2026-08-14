@@ -130,6 +130,37 @@ def test_stage_capture_propagates_into_background_review_thread(hermes_home):
     assert seen[0]["session_key"] == "agent:main:telegram:dm:273403055:417808"
 
 
+def test_durable_card_uses_live_adapter_after_turn_generation_is_stale():
+    from gateway.run import _staged_write_delivery_adapter
+    from gateway.turn_context import TurnContext
+
+    original = object()
+    reconnected = object()
+    ctx = TurnContext(
+        source=_source(),
+        _status_adapter=original,
+        _run_still_current=lambda: False,
+    )
+    runner = SimpleNamespace(_adapter_for_source=lambda _source: reconnected)
+
+    assert _staged_write_delivery_adapter(runner, ctx) is reconnected
+
+
+def test_durable_card_falls_back_to_original_adapter_after_turn_is_stale():
+    from gateway.run import _staged_write_delivery_adapter
+    from gateway.turn_context import TurnContext
+
+    original = object()
+    ctx = TurnContext(
+        source=_source(),
+        _status_adapter=original,
+        _run_still_current=lambda: False,
+    )
+    runner = SimpleNamespace(_adapter_for_source=lambda _source: None)
+
+    assert _staged_write_delivery_adapter(runner, ctx) is original
+
+
 def test_approval_card_uses_captured_id_not_global_pending_queue(hermes_home):
     from gateway.write_approval_interactions import approval_card_for_events
     from tools import write_approval as wa
