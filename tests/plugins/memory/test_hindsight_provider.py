@@ -415,6 +415,10 @@ class TestPostSetup:
         user_home = tmp_path / "user-home"
         user_home.mkdir()
         monkeypatch.setenv("HOME", str(user_home))
+        monkeypatch.setenv(
+            "HINDSIGHT_API_LLM_BASE_URL",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+        )
 
         selections = iter([1, 0])  # local_embedded, openai
         monkeypatch.setattr("hermes_cli.memory_setup._curses_select", lambda *args, **kwargs: next(selections))
