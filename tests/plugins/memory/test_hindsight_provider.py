@@ -281,6 +281,17 @@ class TestConfig:
         assert p._observation_scopes == "per_tag"
 
 
+    def test_initialize_loads_auto_retain_filter_without_name_error(self, tmp_path, monkeypatch):
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(json.dumps({"mode": "local_external", "api_url": "http://localhost:9999"}))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+
+        provider = HindsightMemoryProvider()
+        provider.initialize(session_id="test-session", platform="cli")
+
+        assert provider._mode == "local_external"
+
     def test_custom_config_values(self, provider_with_config):
         p = provider_with_config(
             retain_tags=["tag1", "tag2"],
