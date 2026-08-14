@@ -135,3 +135,20 @@ async def test_verbose_dispatches_mid_run(monkeypatch):
     assert "can't run mid-turn" not in (result or "")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command",
+    ["/memory approve abc12345", "/memory reject abc12345"],
+)
+async def test_memory_decision_dispatches_mid_run(command):
+    """Approval-card decisions must not wait for the active agent turn."""
+    runner = _make_runner()
+    runner._handle_memory_command = AsyncMock(return_value="memory decision applied")
+
+    result = await runner._handle_message(_make_event(command))
+
+    runner._handle_memory_command.assert_awaited_once()
+    assert result == "memory decision applied"
+    assert "can't run mid-turn" not in (result or "")
+
+
