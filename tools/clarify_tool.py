@@ -75,8 +75,10 @@ def _flatten_choice(c) -> str:
 
 def mark_recommended(choices: List[str], recommended_index: Optional[int] = None) -> List[str]:
     """Label the explicitly recommended choice, if one was provided."""
-    if len(choices) < 2 or recommended_index is None:
+    if len(choices) < 2:
         return choices
+    if recommended_index is None:
+        recommended_index = 0
     if isinstance(recommended_index, bool) or not isinstance(recommended_index, int):
         return choices
     if not 0 <= recommended_index < len(choices):
@@ -214,7 +216,7 @@ def _normalize_questions(questions) -> tuple:
             "qid": f"q{index}",
             "id": model_id,
             "question": text,
-            "choices": mark_recommended(list(choices)) if choices else None,
+            "choices": mark_recommended(list(choices), item.get("recommended_index", 0)) if choices else None,
             "choices_offered": list(choices) if choices else None,
             "multi_select": bool(item.get("multi_select")) and bool(choices),
         })
@@ -504,8 +506,9 @@ CLARIFY_SCHEMA = {
                 "minimum": 0,
                 "maximum": MAX_CHOICES - 1,
                 "description": (
-                    "Zero-based index into `choices` for the option the agent "
-                    "actually recommends. Omit when there is no recommendation."
+                    "Zero-based index into `choices` for the option you actually "
+                    "recommend. The UI labels that exact option '(Recommended)'. "
+                    "Omit when you are not making a recommendation."
                 ),
             },
             "questions": {

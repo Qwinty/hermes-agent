@@ -2022,7 +2022,9 @@ class AIAgent:
             # finalize + error exits) so a crash after this line loses at most
             # the in-flight API call's delta. Cheap no-op when nothing queued.
             if self._session_db is not None:
-                self._session_db.flush_token_counts()
+                flush_token_counts = getattr(self._session_db, "flush_token_counts", None)
+                if callable(flush_token_counts):
+                    flush_token_counts()
             note_turn_persisted(self)
 
         if persist_lock is None:
