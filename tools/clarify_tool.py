@@ -75,10 +75,8 @@ def _flatten_choice(c) -> str:
 
 def mark_recommended(choices: List[str], recommended_index: Optional[int] = None) -> List[str]:
     """Label the explicitly recommended choice, if one was provided."""
-    if len(choices) < 2:
+    if len(choices) < 2 or recommended_index is None:
         return choices
-    if recommended_index is None:
-        recommended_index = 0
     if isinstance(recommended_index, bool) or not isinstance(recommended_index, int):
         return choices
     if not 0 <= recommended_index < len(choices):
