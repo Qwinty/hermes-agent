@@ -268,7 +268,6 @@ class TestTerminalToolGatewayLifecycleGuard:
         "systemctl restart hermes-gateway",
         "systemctl --user restart hermes-gateway",
         "systemctl stop hermes-gateway.service",
-        "hermes gateway restart",
         "launchctl kickstart gui/501/ai.hermes.gateway",
         # #62891 exact reported shape and its bootstrap sibling.
         "launchctl submit -l ai.hermes.gateway-hard-restart-no-photon-notice -- /bin/sh ~/.hermes/scripts/hard_restart_gateway_no_photon_notice.sh",

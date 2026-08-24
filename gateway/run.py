@@ -1308,12 +1308,14 @@ def build_resume_recovery_note(
         )
     elif interactive:
         resume_guidance = (
-            "Report to the user that the session was restored "
-            "successfully and ask what they would like to do next."
+            "This is an automatic resume turn with no new user message. "
+            "Continue the interrupted task from the last useful completed "
+            "tool results/context. Do not stop just to announce recovery "
+            "or ask what to do next unless the task is genuinely blocked."
         )
         tail_guidance = (
-            "Do NOT re-execute old tool calls — skip any "
-            "unfinished work from the conversation history."
+            "Do NOT re-execute dangling/interrupted tool calls; use completed "
+            "tool results as context and proceed with the next logical step."
         )
     else:
         resume_guidance = (
@@ -3123,7 +3125,7 @@ def _event_media_is_stt_input(event, index: int) -> bool:
     if message_type in {MessageType.AUDIO, MessageType.DOCUMENT}:
         return False
     return (
-        message_type == MessageType.VOICE
+        message_type in {MessageType.VOICE, MessageType.VIDEO_NOTE}
         or _event_media_type_at(event, index).startswith("audio/")
     )
 
@@ -5397,6 +5399,7 @@ class TurnRunner:
                 source=ctx.source,
                 session_key=ctx.session_key,
                 user_config=ctx.user_config,
+                guest_mode_invocation=ctx.guest_mode_invocation,
             )
             logger.debug(
                 "run_agent resolved: model=%s provider=%s session=%s",
@@ -5415,6 +5418,8 @@ class TurnRunner:
             source=ctx.source,
             session_key=ctx.session_key,
             model=model,
+            user_config=ctx.user_config,
+            guest_mode_invocation=ctx.guest_mode_invocation,
         )
         self._runner._reasoning_config = reasoning_config
         self._runner._service_tier = self._runner._resolve_session_service_tier(
@@ -8021,12 +8026,132 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return source
         return dataclasses.replace(source, thread_id=recovered)
 
+    def _parse_telegram_guest_mode_model_config(
+        self,
+        user_config: Optional[dict],
+    ) -> Optional[dict]:
+        """Return normalized telegram.guest_mode_model config, if present."""
+        telegram_cfg = (user_config or {}).get("telegram") or {}
+        if not isinstance(telegram_cfg, dict):
+            return None
+        raw = telegram_cfg.get("guest_mode_model") or telegram_cfg.get("guest_model")
+        if raw in (None, "", {}):
+            return None
+
+        if isinstance(raw, dict):
+            provider = str(raw.get("provider") or raw.get("provider_slug") or "").strip()
+            model = str(raw.get("model") or raw.get("default") or raw.get("name") or "").strip()
+            base_url = str(raw.get("base_url") or raw.get("api") or raw.get("url") or "").strip()
+            api_key = str(raw.get("api_key") or "").strip()
+            api_mode = str(raw.get("api_mode") or raw.get("transport") or "").strip()
+            if not (provider or model or base_url):
+                return None
+            return {
+                "provider": provider,
+                "model": model,
+                "base_url": base_url,
+                "api_key": api_key,
+                "api_mode": api_mode,
+            }
+
+        if isinstance(raw, str):
+            value = raw.strip()
+            if not value:
+                return None
+            provider = ""
+            model = value
+            # Compact form for named custom providers:
+            #   custom:CommandCode/deepseek-v4-pro
+            if value.lower().startswith("custom:") and "/" in value:
+                provider, model = value.rsplit("/", 1)
+            return {
+                "provider": provider.strip(),
+                "model": model.strip(),
+                "base_url": "",
+                "api_key": "",
+                "api_mode": "",
+            }
+
+        return None
+
+    def _parse_telegram_guest_mode_reasoning_config(
+        self,
+        user_config: Optional[dict],
+    ) -> Optional[dict]:
+        """Return telegram guest-mode reasoning config, if present."""
+        from hermes_constants import parse_reasoning_effort
+
+        telegram_cfg = (user_config or {}).get("telegram") or {}
+        if not isinstance(telegram_cfg, dict):
+            return None
+
+        raw = (
+            telegram_cfg.get("guest_mode_reasoning_effort")
+            or telegram_cfg.get("guest_reasoning_effort")
+            or telegram_cfg.get("guest_reasoning")
+        )
+        guest_model = telegram_cfg.get("guest_mode_model") or telegram_cfg.get("guest_model")
+        if raw in (None, "") and isinstance(guest_model, dict):
+            raw = guest_model.get("reasoning_effort") or guest_model.get("reasoning")
+        if raw in (None, ""):
+            return None
+
+        effort = str(raw).strip()
+        result = parse_reasoning_effort(effort)
+        if effort and result is None:
+            logger.warning("Unknown telegram guest-mode reasoning_effort '%s', using default", effort)
+        return result
+
+    def _apply_telegram_guest_mode_model_override(
+        self,
+        *,
+        user_config: Optional[dict],
+        model: str,
+        runtime_kwargs: dict,
+    ) -> tuple[str, dict]:
+        """Apply telegram.guest_mode_model to guest-mode Telegram invocations."""
+        guest_cfg = self._parse_telegram_guest_mode_model_config(user_config)
+        if not guest_cfg:
+            return model, runtime_kwargs
+
+        guest_model = guest_cfg.get("model") or model
+        guest_provider = guest_cfg.get("provider") or runtime_kwargs.get("provider") or ""
+        try:
+            from hermes_cli.runtime_provider import resolve_runtime_provider
+
+            runtime = resolve_runtime_provider(
+                requested=guest_provider or None,
+                explicit_base_url=guest_cfg.get("base_url") or None,
+                explicit_api_key=guest_cfg.get("api_key") or None,
+                target_model=guest_model,
+            )
+            resolved_runtime = {
+                "api_key": runtime.get("api_key"),
+                "base_url": runtime.get("base_url"),
+                "provider": runtime.get("provider"),
+                "api_mode": guest_cfg.get("api_mode") or runtime.get("api_mode"),
+                "command": runtime.get("command"),
+                "args": list(runtime.get("args") or []),
+                "credential_pool": runtime.get("credential_pool"),
+            }
+            resolved_model = guest_model or runtime.get("model") or model
+            logger.info(
+                "Telegram guest-mode model override: %s/%s -> %s/%s",
+                runtime_kwargs.get("provider"), model,
+                resolved_runtime.get("provider"), resolved_model,
+            )
+            return resolved_model, resolved_runtime
+        except Exception as exc:
+            logger.warning("Failed to apply telegram.guest_mode_model override: %s", exc)
+            return model, runtime_kwargs
+
     def _resolve_session_agent_runtime(
         self,
         *,
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
         user_config: Optional[dict] = None,
+        guest_mode_invocation: bool = False,
     ) -> tuple[str, dict]:
         """Resolve model/runtime for a session.
 
@@ -8134,6 +8259,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if override and resolved_session_key:
             model, runtime_kwargs = self._apply_session_model_override(
                 resolved_session_key, model, runtime_kwargs
+            )
+
+        if guest_mode_invocation and not override:
+            model, runtime_kwargs = self._apply_telegram_guest_mode_model_override(
+                user_config=user_config,
+                model=model,
+                runtime_kwargs=runtime_kwargs,
             )
 
         # When the config has no model.default but a provider was resolved
@@ -9453,6 +9585,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
         model: str = "",
+        user_config: Optional[dict] = None,
+        guest_mode_invocation: bool = False,
     ) -> dict | None:
         """Resolve reasoning effort for a session, honoring session overrides.
 
@@ -9474,6 +9608,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _r_state = self._peek_session_state(resolved_session_key)
             if _r_state is not None and _r_state.conversation.reasoning_override is not None:
                 return _r_state.conversation.reasoning_override
+        if guest_mode_invocation:
+            guest_reasoning = self._parse_telegram_guest_mode_reasoning_config(user_config)
+            if guest_reasoning is not None:
+                return guest_reasoning
         return self._load_reasoning_config(model)
 
     def _set_session_reasoning_override(
@@ -10052,6 +10190,151 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # still small enough to never threaten memory.
     _BUSY_QUEUE_MAX_PENDING = 32
 
+    @staticmethod
+    def _event_has_batch_media(event: Optional[MessageEvent]) -> bool:
+        if event is None or not (getattr(event, "media_urls", None) or []):
+            return False
+        if getattr(event, "message_type", None) in {
+            MessageType.PHOTO,
+            MessageType.VIDEO,
+            MessageType.AUDIO,
+            MessageType.VOICE,
+            MessageType.DOCUMENT,
+            MessageType.VIDEO_NOTE,
+        }:
+            return True
+        return any(
+            str(mtype).startswith(("image/", "audio/", "video/", "application/"))
+            for mtype in (getattr(event, "media_types", None) or [])
+        )
+
+    @staticmethod
+    def _event_has_forwarded_text_context(event: Optional[MessageEvent]) -> bool:
+        if event is None or getattr(event, "message_type", None) != MessageType.TEXT:
+            return False
+        if getattr(event, "media_urls", None):
+            return False
+        return bool(getattr(event, "forward_origin", None)) or (
+            (getattr(event, "text", None) or "").lstrip().startswith("[Forwarded message |")
+        )
+
+    @classmethod
+    def _event_can_join_startup_batch(cls, event: Optional[MessageEvent]) -> bool:
+        return cls._event_has_batch_media(event) or cls._event_has_forwarded_text_context(event)
+
+    @staticmethod
+    def _adapter_declared_method(adapter: Any, name: str) -> Optional[Callable[..., Any]]:
+        try:
+            inspect.getattr_static(adapter, name)
+        except AttributeError:
+            return None
+        method = getattr(adapter, name, None)
+        return method if callable(method) else None
+
+    @staticmethod
+    def _startup_media_grace_seconds() -> float:
+        return 1.0
+
+    @staticmethod
+    def _format_forward_origin_context(forward_origin: Optional[Dict[str, str]]) -> Optional[str]:
+        if not forward_origin:
+            return None
+        parts = ["Forwarded message"]
+        if forward_origin.get("automatic") == "true":
+            parts.append("automatic forward")
+        sender = forward_origin.get("sender_name")
+        if sender:
+            username = forward_origin.get("sender_username")
+            parts.append(f"From: {sender} (@{username})" if username else f"From: {sender}")
+        elif forward_origin.get("type") == "hidden_user":
+            parts.append("From: hidden sender")
+        chat = forward_origin.get("chat_name")
+        if chat:
+            username = forward_origin.get("chat_username")
+            parts.append(f"Chat: {chat} (@{username})" if username else f"Chat: {chat}")
+        if forward_origin.get("author_signature"):
+            parts.append(f"Author: {forward_origin['author_signature']}")
+        if forward_origin.get("date"):
+            parts.append(f"Date: {forward_origin['date']}")
+        return "[" + " | ".join(parts) + "]"
+
+    def _inline_forward_context(self, event: MessageEvent) -> MessageEvent:
+        if not getattr(event, "forward_origin", None):
+            return event
+        context = self._format_forward_origin_context(event.forward_origin)
+        if not context:
+            return event
+        text = event.text or ""
+        if text.lstrip().startswith("[Forwarded message |"):
+            return dataclasses.replace(event, forward_origin=None)
+        return dataclasses.replace(
+            event,
+            text=f"{context}\n\n{text}" if text else context,
+            forward_origin=None,
+        )
+
+    async def _merge_startup_media_followups(
+        self,
+        event: MessageEvent,
+        source: SessionSource,
+        session_key: str,
+    ) -> MessageEvent:
+        """Merge a rapid Telegram forward batch into its starting text turn."""
+        if (
+            source.platform != Platform.TELEGRAM
+            or event.message_type != MessageType.TEXT
+            or getattr(event, "media_urls", None)
+        ):
+            return event
+
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            return event
+        pop_media = self._adapter_declared_method(adapter, "pop_startup_media_event")
+        has_pending = self._adapter_declared_method(adapter, "has_startup_media_pending")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._startup_media_grace_seconds()
+        merged_attachments = 0
+        merged_forwarded_texts = 0
+
+        while True:
+            incoming = None
+            if pop_media is not None:
+                try:
+                    incoming = pop_media(session_key)
+                except Exception:
+                    logger.debug("Telegram startup media pop failed", exc_info=True)
+                    incoming = None
+            if incoming is not None:
+                if getattr(incoming, "forward_origin", None):
+                    incoming = self._inline_forward_context(incoming)
+                    if incoming.message_type == MessageType.TEXT and not incoming.media_urls:
+                        merged_forwarded_texts += 1
+                slot = {session_key: event}
+                merge_pending_message_event(slot, session_key, incoming, merge_text=True)
+                event = slot[session_key]
+                merged_attachments += len(getattr(incoming, "media_urls", None) or [])
+                continue
+
+            pending = False
+            if has_pending is not None:
+                try:
+                    pending = bool(has_pending(session_key))
+                except Exception:
+                    logger.debug("Telegram startup pending check failed", exc_info=True)
+            if not pending or loop.time() >= deadline:
+                break
+            await asyncio.sleep(min(0.05, max(0.0, deadline - loop.time())))
+
+        if merged_attachments or merged_forwarded_texts:
+            logger.info(
+                "Merged %d Telegram startup attachment(s) and %d forwarded text batch(es) into session %s",
+                merged_attachments,
+                merged_forwarded_texts,
+                session_key,
+            )
+        return event
+
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
         adapter = self._adapter_for_source(event.source)
         if not adapter:
@@ -10291,6 +10574,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         _busy_state = self._peek_session_state(session_key)
         running_agent = _busy_state.turn.agent if _busy_state else None
+
+        if (
+            event.source.platform == Platform.TELEGRAM
+            and running_agent is _AGENT_PENDING_SENTINEL
+            and (
+                self._event_has_batch_media(event)
+                or self._event_has_forwarded_text_context(event)
+            )
+        ):
+            logger.debug(
+                "Queueing Telegram startup forward/media follow-up for session %s without interrupt/ack",
+                session_key,
+            )
+            queue_startup = self._adapter_declared_method(adapter, "queue_startup_batch_event")
+            if queue_startup is not None:
+                queue_startup(session_key, event)
+            else:
+                merge_pending_message_event(
+                    adapter._pending_messages,
+                    session_key,
+                    event,
+                    merge_text=self._event_has_forwarded_text_context(event),
+                )
+            return True
 
         busy_text_mode = self._effective_busy_text_mode(event.source)
         if (
@@ -18151,6 +18458,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if getattr(event, "channel_context", None):
             message_text = f"{event.channel_context}\n\n[New message]\n{message_text}"
 
+        forward_context = self._format_forward_origin_context(getattr(event, "forward_origin", None))
+        if forward_context:
+            message_text = f"{forward_context}\n\n{message_text}"
+
         # Declare at outer scope so the audio-file-paths handling block below
         # remains safe when ``event.media_urls`` is empty (no inner block runs).
         audio_file_paths: list[str] = []
@@ -18234,6 +18545,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message_text,
                     audio_paths,
                 )
+                if (
+                    event.message_type == MessageType.VOICE
+                    and len(_successful_transcripts) == 1
+                    and not (event.text or "").strip()
+                ):
+                    _handled, _approval_response = (
+                        await self._dispatch_write_approval_reply_intent(
+                            event,
+                            _successful_transcripts[0],
+                        )
+                    )
+                    if _handled:
+                        return _approval_response or WriteApprovalReply(
+                            "Write-approval action produced no response."
+                        )
                 # Echo each successful transcript back to the user immediately
                 # when configured. Lets users verify STT quality in real-time,
                 # while allowing quiet STT for users who only want the agent to
@@ -18797,6 +19123,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
+        guest_mode_invocation = bool(getattr(event, "guest_mode_invocation", False))
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
@@ -20077,6 +20404,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # attachments (documents, audio, etc.) are not sent to the vision
         # tool even when they appear in the same message.
         # -----------------------------------------------------------------
+        event = await self._merge_startup_media_followups(event, source, session_key)
         message_text = await self._prepare_profile_scoped_inbound_message_text(
             event=event,
             source=source,
@@ -20085,6 +20413,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         if message_text is None:
             return
+        if isinstance(message_text, WriteApprovalReply):
+            return message_text
 
         # Capture the platform event time as message metadata and keep the
         # persisted transcript clean (strip any leading timestamp prefix).
@@ -20382,12 +20712,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _footer_line = ""
             try:
                 from gateway.runtime_footer import build_footer_line as _bfl
+                _reasoning_cfg = self._resolve_session_reasoning_config(source=source)
+                if _reasoning_cfg is None:
+                    _reasoning_effort = "medium"
+                elif _reasoning_cfg.get("enabled") is False:
+                    _reasoning_effort = "none"
+                else:
+                    _reasoning_effort = str(_reasoning_cfg.get("effort") or "medium")
                 _footer_line = _bfl(
                     user_config=_load_gateway_config(),
                     platform_key=_platform_config_key(source.platform),
                     model=agent_result.get("model"),
                     context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
                     context_length=agent_result.get("context_length") or None,
+                    reasoning_effort=_reasoning_effort,
                     cwd=os.environ.get("TERMINAL_CWD", ""),
                     turn_seconds=_turn_seconds,
                 )
@@ -29598,6 +29936,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
+                    guest_mode_invocation=guest_mode_invocation,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

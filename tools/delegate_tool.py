@@ -1594,6 +1594,9 @@ def _build_child_agent(
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
+    # Per-route reasoning override. Ellipsis means use legacy global config;
+    # None means inherit the parent reasoning config.
+    reasoning_effort_override: Any = ...,
     # Per-call role controlling whether the child can further delegate.
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
@@ -1826,7 +1829,11 @@ def _build_child_agent(
         # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
         # False (``reasoning_effort: false``) to "" and inherit the parent
         # instead of disabling thinking for children.
-        delegation_effort = delegation_cfg.get("reasoning_effort")
+        delegation_effort = (
+            delegation_cfg.get("reasoning_effort")
+            if reasoning_effort_override is ...
+            else reasoning_effort_override
+        )
         if delegation_effort or delegation_effort is False:
             from hermes_constants import parse_reasoning_effort
 
@@ -3600,6 +3607,7 @@ def delegate_task(
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
+    route: Optional[str] = None,
     background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
     action: Optional[str] = None,
@@ -3612,8 +3620,8 @@ def delegate_task(
     already-running ones.
 
     Spawn modes (action='spawn' or omitted):
-      - Single: provide goal (+ optional context and role)
-      - Batch:  provide tasks array [{goal, context, role}, ...]
+      - Single: provide goal (+ optional context, role, and route)
+      - Batch:  provide tasks array [{goal, context, role, route}, ...]
 
     Control modes (synchronous, never backgrounded):
       - action='list'  -> live children of this conversation's spawn tree
@@ -3694,16 +3702,6 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
-
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -3730,7 +3728,12 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        single_task: Dict[str, Any] = {"goal": goal, "context": context, "role": top_role}
+        single_task: Dict[str, Any] = {
+            "goal": goal,
+            "context": context,
+            "role": top_role,
+            "route": route,
+        }
         if output_schema is not None:
             single_task["output_schema"] = output_schema
         task_list = [single_task]
@@ -3749,21 +3752,13 @@ def delegate_task(
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
 
-    # Batch-only quality gate: catch malformed fan-outs (placeholder goals,
-    # unexpanded multi-word template markers, 1-task batches) before any
-    # child is spawned.  The single-`goal` form is deliberately exempt —
-    # short goals are valid there.  Duplicate goals are allowed (best-of-N).
-    # Inspired by: MoonshotAI/kimi-code agent-swarm.md validation rules (MIT).
+    # Batch-only quality gate: catch malformed fan-outs before spawning.
     if tasks is not None and isinstance(tasks, list):
         batch_error = _validate_batch_tasks(task_list)
         if batch_error:
             return tool_error(batch_error)
 
-    # T1-24: coerce/validate optional per-task output_schema up front so a
-    # malformed schema fails the whole call loudly instead of spawning
-    # children that can never satisfy their contract. Runs AFTER the
-    # existing goal checks; schema-less tasks resolve to None and take no
-    # new code paths downstream.
+    # Validate optional structured-output contracts before any child is built.
     from tools.delegation_output_schema import coerce_output_schema
 
     task_schemas: List[Optional[Dict[str, Any]]] = []
@@ -3775,6 +3770,23 @@ def delegate_task(
         if schema_err:
             return tool_error(f"Task {i} output_schema invalid: {schema_err}")
         task_schemas.append(coerced_schema)
+
+    # Resolve each child's trusted operator-defined route before side effects.
+    routed_children = []
+    try:
+        for task in task_list:
+            requested_route = task.get("route") or route
+            route_cfg, _route_name, reasoning_override = (
+                _resolve_delegation_route_config(cfg, requested_route)
+            )
+            routed_children.append(
+                (
+                    reasoning_override,
+                    _resolve_delegation_credentials(route_cfg, parent_agent),
+                )
+            )
+    except ValueError as exc:
+        return tool_error(str(exc))
 
     overall_start = time.monotonic()
     results = []
@@ -4414,6 +4426,69 @@ def _resolve_child_credential_pool(
     return None
 
 
+def _resolve_delegation_route_config(
+    cfg: dict, requested_route: Optional[str]
+) -> tuple[dict, Optional[str], Any]:
+    """Resolve a model-facing route into trusted delegation configuration.
+
+    Routes are operator-defined under ``delegation.routes``. The reserved
+    ``inherit`` route clears legacy global endpoint/model pins and inherits both
+    model credentials and reasoning from the parent. With no route and no
+    ``default_route``, legacy ``delegation.model/provider/reasoning_effort``
+    behavior is preserved.
+    """
+    routes = cfg.get("routes") or {}
+    if not isinstance(routes, dict):
+        raise ValueError("delegation.routes must be a mapping of route names to settings.")
+
+    route_name = str(requested_route or cfg.get("default_route") or "").strip()
+    if not route_name:
+        return cfg, None, ...
+
+    if route_name == "inherit":
+        inherited_cfg = dict(cfg)
+        for key in (
+            "model",
+            "provider",
+            "base_url",
+            "api_key",
+            "api_mode",
+            "command",
+            "args",
+        ):
+            inherited_cfg[key] = ""
+        inherited_cfg["reasoning_effort"] = ""
+        return inherited_cfg, route_name, None
+
+    route_cfg = routes.get(route_name)
+    if not isinstance(route_cfg, dict):
+        available = sorted({"inherit", *(str(name) for name in routes)})
+        raise ValueError(
+            f"Unknown delegation route '{route_name}'. Available routes: "
+            f"{', '.join(available)}."
+        )
+
+    resolved_cfg = dict(cfg)
+    # A named route is a self-contained provider/model bundle. Do not let
+    # legacy global direct-endpoint or ACP transport pins leak into it merely
+    # because the route omitted those optional keys.
+    for key in (
+        "model",
+        "provider",
+        "base_url",
+        "api_key",
+        "api_mode",
+        "command",
+        "args",
+    ):
+        resolved_cfg[key] = ""
+    resolved_cfg.update(route_cfg)
+    reasoning_override = route_cfg.get("reasoning_effort")
+    if "reasoning_effort" not in route_cfg:
+        reasoning_override = None
+    return resolved_cfg, route_name, reasoning_override
+
+
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     """Resolve credentials for subagent delegation.
 
@@ -4620,11 +4695,8 @@ def _build_top_level_description() -> str:
         "transcript paths, and the completed result (one consolidated message "
         "for a batch) re-enters the conversation on its own. Do NOT wait or "
         "poll; continue other work.\n\n"
-        "LIVE ORCHESTRATION: while children run, this tool also controls "
-        "them — action='list' (live children + ids), action='steer' "
-        "(subagent_id + message, redirect without stopping), action='stop' "
-        "(subagent_id, end early; partial result still returns). Steer when "
-        "a live transcript shows a child drifting.\n\n"
+        "LIVE CONTROL: action='list' shows running children; action='steer' "
+        "redirects one; action='stop' ends one early.\n\n"
         "USE FOR: reasoning-heavy subtasks, work that would flood your context "
         "with intermediate data, or independent parallel workstreams.\n"
         "DO NOT USE FOR (use these instead):\n"
@@ -4647,8 +4719,9 @@ def _build_top_level_description() -> str:
         "- Leaf children (the default) cannot call delegate_task, clarify, "
         "memory, send_message, or cronjob; orchestrators regain only "
         "delegate_task.\n"
-        "- Children inherit the parent model and fallback chain unless pinned "
-        "globally via delegation.provider / delegation.model in config.yaml. "
+        "Children use the requested operator-defined route when provided; "
+        "otherwise delegation.default_route applies. The reserved 'inherit' "
+        "route keeps the parent model and fallback chain. "
         "Results are returned as an array, one entry per task."
     )
 
@@ -4663,7 +4736,8 @@ def _build_tasks_param_description() -> str:
         f"Batch mode: tasks to run in parallel (up to {max_children} for this "
         f"user, set via delegation.max_concurrent_children). Each gets "
         "its own subagent with isolated context and terminal session. "
-        "When provided, top-level goal/context/role are ignored."
+        "When provided, top-level goal/context/role are ignored; the top-level "
+        "route still applies unless a task supplies its own route."
     )
 
 
@@ -4704,6 +4778,17 @@ def _build_role_param_description() -> str:
     )
 
 
+def _configured_route_names() -> List[str]:
+    try:
+        routes = _load_config().get("routes") or {}
+    except Exception:
+        routes = {}
+    names = {"inherit"}
+    if isinstance(routes, dict):
+        names.update(str(name) for name in routes if str(name).strip())
+    return sorted(names)
+
+
 def _build_dynamic_schema_overrides() -> dict:
     """Return per-call schema overrides reflecting current config.
 
@@ -4720,6 +4805,15 @@ def _build_dynamic_schema_overrides() -> dict:
     }
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
     overrides_params["properties"]["role"]["description"] = _build_role_param_description()
+    route_names = _configured_route_names()
+    overrides_params["properties"]["route"]["enum"] = route_names
+    task_items = dict(overrides_params["properties"]["tasks"]["items"])
+    task_items["properties"] = {
+        key: dict(value)
+        for key, value in task_items["properties"].items()
+    }
+    task_items["properties"]["route"]["enum"] = route_names
+    overrides_params["properties"]["tasks"]["items"] = task_items
 
     return {
         "description": _build_top_level_description(),
@@ -4761,6 +4855,15 @@ DELEGATE_TASK_SCHEMA = {
                     "specific you are, the better the subagent performs."
                 ),
             },
+            "route": {
+                "type": "string",
+                "description": (
+                    "Operator-defined delegation route. Use 'scout' for "
+                    "mechanical discovery, 'reviewer' for independent review, "
+                    "or 'inherit' to keep the parent model. Omit to use "
+                    "delegation.default_route."
+                ),
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -4770,6 +4873,13 @@ DELEGATE_TASK_SCHEMA = {
                         "context": {
                             "type": "string",
                             "description": "Task-specific context",
+                        },
+                        "route": {
+                            "type": "string",
+                            "description": (
+                                "Per-task delegation route. Overrides the "
+                                "top-level route for this child."
+                            ),
                         },
                         "role": {
                             "type": "string",
@@ -4913,6 +5023,7 @@ registry.register(
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
+        route=args.get("route"),
         background=_model_background_value(args, kw.get("parent_agent")),
         output_schema=args.get("output_schema"),
         action=args.get("action"),

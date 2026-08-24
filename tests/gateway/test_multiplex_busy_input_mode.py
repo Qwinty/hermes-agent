@@ -242,6 +242,7 @@ async def test_secondary_adapter_busy_guard_stamps_profile_before_resolving_mode
 ):
     """Per-profile adapters route busy events before the message wrapper runs."""
     monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
+    monkeypatch.setenv("HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS", "0")
     runner = _runner(default_mode="interrupt")
     adapter = await _load_profile_snapshot(
         runner,

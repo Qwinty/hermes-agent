@@ -597,10 +597,11 @@ DEFAULT_CONTEXT_LENGTHS = {
 }
 
 # xAI Grok models that ACCEPT the `reasoning.effort` parameter on
-# api.x.ai. Verified live against /v1/responses 2026-05-10:
+# api.x.ai. Verified live against /v1/responses 2026-05-10, extended for
+# grok-4.5 (docs + CPA catalog 2026-07-08):
 #
 #   ACCEPTS effort:  grok-3-mini, grok-3-mini-fast, grok-4.20-multi-agent-0309,
-#                    grok-4.3
+#                    grok-4.3, grok-4.5
 #   REJECTS effort:  grok-3, grok-4, grok-4-0709, grok-4-fast-(non-)reasoning,
 #                    grok-4-1-fast-(non-)reasoning, grok-4.20-0309-(non-)reasoning,
 #                    grok-code-fast-1
@@ -609,6 +610,9 @@ DEFAULT_CONTEXT_LENGTHS = {
 # effort dial — so callers should send no `reasoning` key at all rather
 # than a default `medium` (which 400s with "Model X does not support
 # parameter reasoningEffort").
+#
+# Grok 4.5 official dial: low | medium | high (default high; cannot disable).
+# Grok 4.20 multi-agent also accepts xhigh (agent count, not depth).
 _GROK_EFFORT_CAPABLE_PREFIXES = (
     "grok-3-mini",
     "grok-4.20-multi-agent",
@@ -744,12 +748,52 @@ _URL_TO_PROVIDER: Dict[str, str] = {
     "ollama.com": "ollama-cloud",
 }
 
+
+def _is_ambiguous_local_provider_host(host: str) -> bool:
+    """Return True when a hostname is too local/generic for provider inference.
+
+    Provider profiles are allowed to point at loopback/private proxies (for
+    example Maxim's local CommandCode proxy on 127.0.0.1:8099).  Mapping such a
+    hostname globally would make every other local OpenAI-compatible proxy on
+    the same host (CPA, LM Studio, Ollama, etc.) look like that provider and
+    skip its own /models metadata.  Local/private endpoints must be resolved by
+    explicit provider config or by probing the endpoint, not by host-only
+    inference.
+    """
+    normalized = (host or "").strip().lower().strip("[]")
+    if not normalized:
+        return True
+    if normalized in {
+        "localhost",
+        "host.docker.internal",
+        "gateway.docker.internal",
+        "docker.for.mac.localhost",
+        "docker.for.win.localhost",
+    }:
+        return True
+    try:
+        ip = ipaddress.ip_address(normalized)
+    except ValueError:
+        return False
+    return bool(
+        ip.is_loopback
+        or ip.is_private
+        or ip.is_link_local
+        or ip.is_unspecified
+        or ip in _TAILSCALE_CGNAT
+    )
+
+
 # Auto-extend with hostnames derived from provider profiles.
 # Any provider with a base_url not already in the map gets added automatically.
 try:
     for _pp in _list_providers():
         _host = _pp.get_hostname()
-        if _host and _host not in _URL_TO_PROVIDER:
+        if (
+            _host
+            and _host not in _URL_TO_PROVIDER
+            and not _is_ambiguous_local_provider_host(_host)
+        ):
             _URL_TO_PROVIDER[_host] = _pp.name
 except Exception:
     pass
@@ -767,6 +811,9 @@ def _infer_provider_from_url(base_url: str) -> Optional[str]:
         return None
     parsed = urlparse(normalized if "://" in normalized else f"https://{normalized}")
     host = parsed.netloc.lower() or parsed.path.lower()
+    host_only = (parsed.hostname or host.split(":", 1)[0]).lower()
+    if _is_ambiguous_local_provider_host(host_only):
+        return None
     for url_part, provider in _URL_TO_PROVIDER.items():
         if url_part in host:
             return provider
