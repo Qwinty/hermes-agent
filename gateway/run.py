@@ -2696,6 +2696,11 @@ from gateway.shutdown_watchdog import (
     resolve_shutdown_watchdog_delay,
     start_loop_liveness_watchdog,
 )
+from gateway.write_approval_interactions import (
+    WRITE_APPROVAL_METADATA_KEY,
+    WriteApprovalReply,
+    build_pending_surface,
+)
 from gateway.restart import (
     DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT,
     DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT,
@@ -5896,12 +5901,26 @@ class TurnRunner:
         def _deliver_bg_review_message(message: str) -> None:
             if not ctx._status_adapter or not ctx._run_still_current():
                 return
-            safe_schedule_threadsafe(
-                ctx._status_adapter.send(
+            async def _deliver() -> None:
+                metadata = _non_conversational_metadata(
+                    ctx._status_thread_metadata,
+                    platform=ctx.source.platform,
+                )
+                surface = await asyncio.to_thread(
+                    build_pending_surface,
+                    ("memory", "skills"),
+                )
+                if surface:
+                    metadata = dict(metadata or {})
+                    metadata[WRITE_APPROVAL_METADATA_KEY] = surface
+                await ctx._status_adapter.send(
                     ctx._status_chat_id,
                     message,
-                    metadata=_interim_metadata(_non_conversational_metadata(ctx._status_thread_metadata, platform=ctx.source.platform)),
-                ),
+                    metadata=_interim_metadata(metadata),
+                )
+
+            safe_schedule_threadsafe(
+                _deliver(),
                 ctx._loop_for_step,
                 logger=logger,
                 log_message="background_review_callback scheduling error",
@@ -20502,6 +20521,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
+                guest_mode_invocation=guest_mode_invocation,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -28220,6 +28240,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        guest_mode_invocation: bool = False,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -28240,6 +28261,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                guest_mode_invocation=guest_mode_invocation,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -28253,6 +28275,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
+                guest_mode_invocation=guest_mode_invocation,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -28396,6 +28419,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
+        guest_mode_invocation: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -28436,6 +28460,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         enabled_toolsets = self._resolve_enabled_toolsets_for_source(
             user_config, source, platform_key
         )
+        if guest_mode_invocation:
+            telegram_cfg = user_config.get("telegram") or {}
+            raw_guest_toolsets = (
+                telegram_cfg.get("guest_mode_toolsets")
+                or telegram_cfg.get("guest_tools")
+                or user_config.get("platform_toolsets", {}).get("telegram_guest")
+                or []
+            ) if isinstance(telegram_cfg, dict) else []
+            if isinstance(raw_guest_toolsets, str):
+                raw_guest_toolsets = [item.strip() for item in raw_guest_toolsets.split(",") if item.strip()]
+            enabled_toolsets = sorted(str(item) for item in raw_guest_toolsets)
         agent_cfg_local = user_config.get("agent") or {}
         from agent.skill_utils import parse_config_string_list
 
@@ -28702,6 +28737,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _interrupt_depth=_interrupt_depth,
             event_message_id=event_message_id,
             moa_config=moa_config,
+            guest_mode_invocation=guest_mode_invocation,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,

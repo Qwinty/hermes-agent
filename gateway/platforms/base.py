@@ -3802,6 +3802,7 @@ class BasePlatformAdapter(ABC):
         for candidate in (
             getattr(source, "profile", None) if source is not None else None,
             getattr(self, "_owner_profile", None),
+            getattr(self, "_gateway_profile_name", None),
         ):
             if isinstance(candidate, str) and candidate.strip():
                 return candidate

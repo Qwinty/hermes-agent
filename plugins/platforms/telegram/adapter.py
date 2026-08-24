@@ -10626,20 +10626,133 @@ class TelegramAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     def _text_batch_key(self, event: MessageEvent) -> str:
-        """Session-scoped key for text message batching.
+        """Session-scoped key for text message batching."""
+        return self._event_session_key(event)
 
-        Applies the installed topic-recovery hook first so DM-topic batches
-        coalesce on (and dispatch to) the recovered lane rather than the
-        raw inbound ``message_thread_id`` Telegram may have attached.
-        """
+    @staticmethod
+    def _format_forward_origin_context(forward_origin: Optional[Dict[str, str]]) -> Optional[str]:
+        if not forward_origin:
+            return None
+        parts = ["Forwarded message"]
+        if forward_origin.get("automatic") == "true":
+            parts.append("automatic forward")
+        sender = forward_origin.get("sender_name")
+        if sender:
+            username = forward_origin.get("sender_username")
+            parts.append(f"From: {sender} (@{username})" if username else f"From: {sender}")
+        elif forward_origin.get("type") == "hidden_user":
+            parts.append("From: hidden sender")
+        chat = forward_origin.get("chat_name")
+        if chat:
+            username = forward_origin.get("chat_username")
+            parts.append(f"Chat: {chat} (@{username})" if username else f"Chat: {chat}")
+        if forward_origin.get("author_signature"):
+            parts.append(f"Author: {forward_origin['author_signature']}")
+        if forward_origin.get("date"):
+            parts.append(f"Date: {forward_origin['date']}")
+        return "[" + " | ".join(parts) + "]"
+
+    def _event_with_inline_forward_context(self, event: MessageEvent) -> MessageEvent:
+        context = self._format_forward_origin_context(getattr(event, "forward_origin", None))
+        if not context:
+            return event
+        text = event.text or ""
+        if not text.lstrip().startswith("[Forwarded message |"):
+            event.text = f"{context}\n\n{text}" if text else context
+        event.forward_origin = None
+        return event
+
+    def _event_session_key(self, event: MessageEvent) -> str:
         from gateway.session import build_session_key
         self._apply_topic_recovery(event)
+        profile = event.source.profile or getattr(self, "_gateway_profile_name", None) or self._session_key_profile(event.source)
+        if profile and not event.source.profile:
+            event.source.profile = profile
         return build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
             profile=self._session_key_profile(event.source),
         )
+
+    def _track_media_download_start(self, event: MessageEvent) -> str:
+        session_key = self._event_session_key(event)
+        counts = self._media_downloads_in_progress_by_session
+        counts[session_key] = counts.get(session_key, 0) + 1
+        return session_key
+
+    def _track_media_download_done(self, session_key: Optional[str]) -> None:
+        if not session_key:
+            return
+        remaining = self._media_downloads_in_progress_by_session.get(session_key, 0) - 1
+        if remaining > 0:
+            self._media_downloads_in_progress_by_session[session_key] = remaining
+        else:
+            self._media_downloads_in_progress_by_session.pop(session_key, None)
+
+    def queue_startup_batch_event(self, session_key: str, event: MessageEvent) -> None:
+        event = self._event_with_inline_forward_context(event)
+        merge_pending_message_event(
+            self._startup_batch_events,
+            session_key,
+            event,
+            merge_text=(event.message_type == MessageType.TEXT),
+        )
+
+    def has_startup_media_pending(self, session_key: str) -> bool:
+        if not session_key:
+            return False
+        if session_key in self._startup_batch_events:
+            return True
+        if self._media_downloads_in_progress_by_session.get(session_key, 0) > 0:
+            return True
+        prefix = f"{session_key}:"
+        if any(key == f"{session_key}:photo-burst" or key.startswith(prefix + "album:") for key in self._pending_photo_batches):
+            return True
+        for event in self._media_group_events.values():
+            try:
+                if self._event_session_key(event) == session_key:
+                    return True
+            except Exception:
+                continue
+        forwarded_text = self._pending_text_batches.get(session_key)
+        return bool(forwarded_text and (forwarded_text.text or "").lstrip().startswith("[Forwarded message |"))
+
+    def pop_startup_media_event(self, session_key: str) -> Optional[MessageEvent]:
+        if not session_key:
+            return None
+        merged: Dict[str, MessageEvent] = {}
+        startup_event = self._startup_batch_events.pop(session_key, None)
+        if startup_event is not None:
+            merge_pending_message_event(merged, session_key, startup_event, merge_text=(startup_event.message_type == MessageType.TEXT))
+        text_event = self._pending_text_batches.pop(session_key, None)
+        if text_event and (text_event.text or "").lstrip().startswith("[Forwarded message |"):
+            task = self._pending_text_batch_tasks.pop(session_key, None)
+            if task is not None and not task.done():
+                task.cancel()
+            merge_pending_message_event(merged, session_key, text_event, merge_text=True)
+        elif text_event is not None:
+            self._pending_text_batches[session_key] = text_event
+        for key in [key for key in list(self._pending_photo_batches) if key == f"{session_key}:photo-burst" or key.startswith(f"{session_key}:album:")]:
+            event = self._pending_photo_batches.pop(key, None)
+            task = self._pending_photo_batch_tasks.pop(key, None)
+            if task is not None and not task.done():
+                task.cancel()
+            if event is not None and event.media_urls:
+                merge_pending_message_event(merged, session_key, event)
+        for group_id, event in list(self._media_group_events.items()):
+            try:
+                matches = self._event_session_key(event) == session_key
+            except Exception:
+                matches = False
+            if matches:
+                self._media_group_events.pop(group_id, None)
+                task = self._media_group_tasks.pop(group_id, None)
+                if task is not None and not task.done():
+                    task.cancel()
+                if event.media_urls:
+                    merge_pending_message_event(merged, session_key, event)
+        return merged.get(session_key)
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer.
@@ -10653,6 +10766,7 @@ class TelegramAdapter(BasePlatformAdapter):
             self._hold_inbound_event(event, where="text-enqueue")
             return
 
+        event = self._event_with_inline_forward_context(event)
         key = self._text_batch_key(event)
         existing = self._pending_text_batches.get(key)
         chunk_len = len(event.text or "")

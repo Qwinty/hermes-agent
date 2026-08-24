@@ -1202,6 +1202,16 @@ def _resolve_named_custom_runtime(
     ]
     api_key = next((candidate for candidate in api_key_candidates if has_usable_secret(candidate)), "")
 
+    provider_key = str(custom_provider.get("provider_key", "") or "").strip().lower()
+    runtime_provider = "custom"
+    if provider_key in {"cliproxyapi"}:
+        try:
+            from providers import get_provider_profile
+            if get_provider_profile(provider_key) is not None:
+                runtime_provider = provider_key
+        except Exception:
+            pass
+
     # A ``key_cmd`` credential is minted per request rather than resolved once:
     # gateways that issue short-lived bearers would otherwise go stale
     # mid-session and 401. Both wire clients already accept a callable api_key
@@ -1219,7 +1229,7 @@ def _resolve_named_custom_runtime(
             api_key = token_provider
 
     result = {
-        "provider": "custom",
+        "provider": runtime_provider,
         "api_mode": custom_provider.get("api_mode")
         or _detect_api_mode_for_url(base_url)
         or "chat_completions",
@@ -1987,6 +1997,24 @@ def resolve_runtime_provider(
             and not has_runtime_override
         )
 
+    if provider == "qwen-oauth":
+        try:
+            creds = resolve_qwen_runtime_credentials()
+            return {
+                "provider": "qwen-oauth",
+                "api_mode": "chat_completions",
+                "base_url": creds.get("base_url", "").rstrip("/"),
+                "api_key": creds.get("api_key", ""),
+                "source": creds.get("source", "qwen-cli"),
+                "expires_at_ms": creds.get("expires_at_ms"),
+                "requested_provider": requested_provider,
+            }
+        except AuthError:
+            if requested_provider != "auto":
+                raise
+            logger.info("Qwen OAuth credentials failed; falling through to next provider.")
+            provider = "openrouter"
+
     try:
         pool = load_pool(provider) if should_use_pool else None
     except Exception:
@@ -2132,8 +2160,8 @@ def resolve_runtime_provider(
         except AuthError:
             if requested_provider != "auto":
                 raise
-            logger.info("Qwen OAuth credentials failed; "
-                        "falling through to next provider.")
+            logger.info("Qwen OAuth credentials failed; falling through to next provider.")
+            provider = "openrouter"
 
     if provider == "minimax-oauth":
         pconfig = PROVIDER_REGISTRY.get(provider)

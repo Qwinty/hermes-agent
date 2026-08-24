@@ -3806,8 +3806,17 @@ def delegate_task(
         wrap_progress_callback,
     )
 
+    # Live transcript metadata is a single legacy model/provider pair.  For a
+    # mixed-route batch, leave it neutral rather than attributing every child
+    # to the first route.
+    _route_pairs = [creds for _reasoning, creds in routed_children]
+    _route_models = {str(c.get("model") or "") for c in _route_pairs}
+    _route_providers = {str(c.get("provider") or "") for c in _route_pairs}
+    _transcript_model = next(iter(_route_models)) if len(_route_models) == 1 else None
+    _transcript_provider = next(iter(_route_providers)) if len(_route_providers) == 1 else None
+
     live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context, model=creds.get("model"), provider=creds.get("provider")
+        task_list, context, model=_transcript_model, provider=_transcript_provider
     )
 
     # Capture the ORIGINATING session's wake target BEFORE any child agent is
@@ -3849,6 +3858,7 @@ def delegate_task(
             from tools.delegation_output_schema import append_output_contract
 
             _child_context = append_output_contract(_child_context, _task_schema)
+        reasoning_override, creds = routed_children[i]
         try:
             child = _build_child_preserving_parent_tools(
                 task_index=i,
@@ -3869,6 +3879,7 @@ def delegate_task(
                 override_max_tokens=creds.get("max_output_tokens"),
                 override_acp_command=creds.get("command"),
                 override_acp_args=creds.get("args"),
+                reasoning_effort_override=reasoning_override,
                 role=effective_role,
             )
         except ValueError as exc:
@@ -4257,10 +4268,11 @@ def delegate_task(
             goals=_goals,
             context=context,
             # Metadata for the completion block only; subagents inherit the
-            # parent's toolsets (no model-facing toolsets arg).
+            # parent's toolsets (no model-facing toolsets arg). Mixed batches
+            # have no single model, so use a neutral value.
             toolsets=None,
             role=top_role,
-            model=creds["model"],
+            model=_transcript_model,
             session_key=_session_key,
             origin_ui_session_id=_origin_ui_session_id,
             origin_session_id=_wake_sid,
