@@ -537,6 +537,65 @@ def _strip_mdv2(text: str) -> str:
     return cleaned
 
 
+def _citation_source_urls(content: str) -> dict[str, str]:
+    """Return citation number -> URL mappings declared in a Sources block.
+
+    Research responses commonly use ``[16]`` inline citations and then list
+    the corresponding URLs under ``Sources``/``Источники``.  Markdown treats
+    the citation marker as plain text, so Telegram cannot make it clickable
+    unless the adapter joins the two pieces.  Restrict parsing to an explicit
+    sources block so ordinary bracketed prose is left untouched.
+    """
+    lines = content.splitlines()
+    source_start = None
+    for index, line in enumerate(lines):
+        normalized = line.strip().strip("*#_ ").rstrip(":").strip("*#_ ").strip().lower()
+        if normalized in {"sources", "источники"}:
+            source_start = index + 1
+            break
+    if source_start is None:
+        return {}
+
+    mappings: dict[str, str] = {}
+    for line in lines[source_start:]:
+        match = re.match(r"^\s*\[(\d+)\]\s+(.+?)\s*$", line)
+        if not match:
+            continue
+        number, remainder = match.groups()
+
+        # Prefer a URL inside an existing Markdown link.  The source lines
+        # produced by the citation skill normally use this form.
+        link_match = re.search(r"\]\((https?://[^)\s]+)\)", remainder)
+        if link_match:
+            mappings[number] = link_match.group(1)
+            continue
+
+        # Also support the older ``[1] https://example.com - title`` form.
+        bare_match = re.search(r"https?://\S+", remainder)
+        if bare_match:
+            url = bare_match.group(0).rstrip(".,;:!?\u3002\u3001")
+            mappings[number] = url
+    return mappings
+
+
+def _link_citations_to_sources(content: str) -> str:
+    """Turn declared bare citation markers such as ``[16]`` into links."""
+    source_urls = _citation_source_urls(content)
+    if not source_urls:
+        return content
+
+    def replace(match: re.Match[str]) -> str:
+        number = match.group(1)
+        url = source_urls.get(number)
+        if not url:
+            return match.group(0)
+        return f"[[{number}]]({url})"
+
+    # Do not touch an already-linked marker (``[16](...)``).  Keep adjacent
+    # citations such as ``[16][17]`` eligible for conversion.
+    return re.sub(r"\[(\d+)\](?!\()", replace, content)
+
+
 _CHUNK_INDICATOR_ON_FENCE_RE = re.compile(
     r'(?m)^``` (?P<indicator>(?:\\)?\(\d+/\d+(?:\\)?\))$'
 )
@@ -9023,16 +9082,24 @@ class TelegramAdapter(BasePlatformAdapter):
             text,
         )
 
-        # 3) Convert markdown links – escape the display text; inside the URL
-        #    only ')' and '\' need escaping per the MarkdownV2 spec.
+        # 3) Join numbered citations with the URLs declared in the Sources
+        #    block, so inline markers such as [16] are clickable in Telegram.
+        text = _link_citations_to_sources(text)
+
+        # 4) Convert markdown links – escape the display text; inside the URL
+        #    only ')' and '\\' need escaping per the MarkdownV2 spec.
         def _convert_link(m):
             display = _escape_mdv2(m.group(1))
             url = m.group(2).replace('\\', '\\\\').replace(')', '\\)')
             return _ph(f'[{display}]({url})')
 
-        text = re.sub(r'\[([^\]]+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)', _convert_link, text)
+        text = re.sub(
+            r'\[((?:\[[^\]]+\]|[^\]])+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)',
+            _convert_link,
+            text,
+        )
 
-        # 4) Convert markdown headers (## Title) → bold *Title*
+        # 5) Convert markdown headers (## Title) → bold *Title*
         def _convert_header(m):
             inner = m.group(1).strip()
             # Strip redundant bold markers that may appear inside a header
@@ -9043,14 +9110,14 @@ class TelegramAdapter(BasePlatformAdapter):
             r'^#{1,6}\s+(.+)$', _convert_header, text, flags=re.MULTILINE
         )
 
-        # 5) Convert bold: **text** → *text* (MarkdownV2 bold)
+        # 6) Convert bold: **text** → *text* (MarkdownV2 bold)
         text = re.sub(
             r'\*\*(.+?)\*\*',
             lambda m: _ph(f'*{_escape_mdv2(m.group(1))}*'),
             text,
         )
 
-        # 6) Convert italic: *text* (single asterisk) → _text_ (MarkdownV2 italic)
+        # 7) Convert italic: *text* (single asterisk) → _text_ (MarkdownV2 italic)
         #    [^*\n]+ prevents matching across newlines (which would corrupt
         #    bullet lists using * markers and multi-line content).
         text = re.sub(
@@ -9059,21 +9126,21 @@ class TelegramAdapter(BasePlatformAdapter):
             text,
         )
 
-        # 7) Convert strikethrough: ~~text~~ → ~text~ (MarkdownV2)
+        # 8) Convert strikethrough: ~~text~~ → ~text~ (MarkdownV2)
         text = re.sub(
             r'~~(.+?)~~',
             lambda m: _ph(f'~{_escape_mdv2(m.group(1))}~'),
             text,
         )
 
-        # 8) Convert spoiler: ||text|| → ||text|| (protect from | escaping)
+        # 9) Convert spoiler: ||text|| → ||text|| (protect from | escaping)
         text = re.sub(
             r'\|\|(.+?)\|\|',
             lambda m: _ph(f'||{_escape_mdv2(m.group(1))}||'),
             text,
         )
 
-        # 9) Convert blockquotes: > at line start → protect > from escaping
+        # 10) Convert blockquotes: > at line start → protect > from escaping
         #    Handle both regular blockquotes (> text) and expandable blockquotes
         #    (Telegram MarkdownV2: **> for expandable start, || to end the quote)
         def _convert_blockquote(m):
@@ -9092,15 +9159,15 @@ class TelegramAdapter(BasePlatformAdapter):
             flags=re.MULTILINE,
         )
 
-        # 10) Escape remaining special characters in plain text
+        # 11) Escape remaining special characters in plain text
         text = _escape_mdv2(text)
 
-        # 11) Restore placeholders in reverse insertion order so that
+        # 12) Restore placeholders in reverse insertion order so that
         #    nested references (a placeholder inside another) resolve correctly.
         for key in reversed(list(placeholders.keys())):
             text = text.replace(key, placeholders[key])
 
-        # 12) Safety net: escape unescaped ( ) { } that slipped through
+        # 13) Safety net: escape unescaped ( ) { } that slipped through
         #     placeholder processing.  Split the text into code/non-code
         #     segments so we never touch content inside ``` or ` spans.
         _code_split = re.split(r'(```[\s\S]*?```|`[^`]+`)', text)
